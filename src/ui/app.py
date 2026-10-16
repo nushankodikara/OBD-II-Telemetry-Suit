@@ -1037,9 +1037,18 @@ class CarRecordAnalyzerApp(ctk.CTk):
             messagebox.showwarning("No CSV Logs", f"No valid Car Scanner CSV records found in:\n{dir_path}", parent=self)
             return
 
-        self.all_trips = trips
-        self.selected_trips = list(trips)
-        self.record_panel.set_trips(trips)
+        # Ensure strict deduplication of loaded trips by canonical file path
+        seen_paths = set()
+        unique_trips = []
+        for t in trips:
+            norm_p = os.path.abspath(t.file_path)
+            if norm_p not in seen_paths:
+                seen_paths.add(norm_p)
+                unique_trips.append(t)
+
+        self.all_trips = unique_trips
+        self.selected_trips = list(unique_trips)
+        self.record_panel.set_trips(unique_trips)
         self._persist_session()
 
         if not self.profile.is_configured:

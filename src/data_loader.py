@@ -355,12 +355,14 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
 def load_all_records(directory_path: str = "Records") -> List[ScanTrip]:
     """Scan and parse all Car Scanner ELM OBD2 CSV files in the directory and subdirectories."""
     trips = []
-    # Search root and all nested subdirectories
-    csv_files = sorted(
-        glob.glob(os.path.join(directory_path, "*.csv"))
-        + glob.glob(os.path.join(directory_path, "**", "*.csv"), recursive=True)
-    )
-    for path in csv_files:
+    # Search root and all nested subdirectories, strictly deduplicating canonical file paths
+    csv_paths = set()
+    for root, _, files in os.walk(directory_path):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                csv_paths.add(os.path.abspath(os.path.join(root, f)))
+
+    for path in sorted(csv_paths):
         trip = parse_obd_csv(path)
         if trip is not None:
             trips.append(trip)

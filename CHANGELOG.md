@@ -30,6 +30,10 @@ Strict Project Requirement: Zero emojis are used across this changelog and entir
 - Updated top banner `Optimal Efficiency Spot` gauge card to reflect realistic propulsive cruising sweet spots.
 - Updated Pre-Ingestion Data Cleanup audit card to display DFCO engagement percentage, active cut seconds, and conserved fuel liters.
 
+### Fixed
+- Fixed double import bug in `load_all_records()` in `src/data_loader.py` where combining non-recursive `*.csv` and recursive `**/*.csv` globs matched root CSV files twice, doubling all parsed records.
+- Added strict canonical path set deduplication in both `load_all_records()` and `CarRecordAnalyzerApp._on_import_folder()`, ensuring every log file is ingested exactly once.
+
 ---
 
 ## [0.2.0-beta] - 2026-10-16

@@ -55,7 +55,9 @@ class TestOBDDataLoader(unittest.TestCase):
 
     def test_load_records_directory(self):
         trips = load_all_records("Records/exported_records (6)")
-        self.assertGreaterEqual(len(trips), 8)
+        self.assertEqual(len(trips), 8)
+        file_paths = [t.file_path for t in trips]
+        self.assertEqual(len(file_paths), len(set(file_paths)))
         for t in trips:
             self.assertGreater(len(t.data), 0)
 
