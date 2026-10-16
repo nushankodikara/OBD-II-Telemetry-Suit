@@ -13,8 +13,24 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter
 from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import HuberRegressor
 
 from src.data_loader import ScanTrip
+
+
+@dataclass
+class DFCOAnalysisResult:
+    """Diagnostic evaluation and metrics for Deceleration Fuel Cut-Off (DFCO)."""
+    has_data: bool = False
+    eligible_decel_seconds: float = 0.0
+    active_dfco_seconds: float = 0.0
+    inactive_dfco_seconds: float = 0.0
+    dfco_engagement_pct: float = 0.0
+    fuel_saved_liters: float = 0.0
+    status: str = "[NO DATA]"  # [OPTIMAL], [GOOD], [PARTIAL], [INACTIVE], [NO OVERRUN]
+    primary_inhibit_reasons: List[str] = field(default_factory=list)
+    diagnostic_summary: str = ""
+    mechanic_recommendations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -361,11 +377,122 @@ class VehicleAnalyzer:
             "gear_lines": gear_lines,
         }
 
+    def analyze_dfco(self, trips: List[ScanTrip]) -> DFCOAnalysisResult:
+        """Analyze Deceleration Fuel Cut-Off (DFCO) engagement, missed cut-offs, and fuel saved."""
+        if not trips:
+            return DFCOAnalysisResult()
+
+        total_eligible = 0.0
+        total_active = 0.0
+        total_inactive = 0.0
+        total_fuel_saved = 0.0
+
+        coolant_inhibit_count = 0
+        throttle_margin_count = 0
+        speed_density_artifact_count = 0
+        low_rpm_count = 0
+
+        for trip in trips:
+            df = trip.data
+            if df.empty or "speed_kmh" not in df.columns:
+                continue
+
+            rep = trip.cleanup_report
+            total_eligible += rep.dfco_eligible_events
+            total_active += rep.dfco_active_events
+            total_inactive += rep.dfco_inactive_events
+            total_fuel_saved += rep.fuel_saved_liters
+
+            min_thr = float(df["throttle_pct"].min()) if "throttle_pct" in df.columns else 11.4
+            closed_thr = min_thr + 1.5
+
+            if "is_dfco" in df.columns:
+                decel_cand = (df["speed_kmh"] >= 15.0) & (df.get("engine_rpm", 1500) >= 1100.0)
+                if "throttle_pct" in df.columns:
+                    decel_cand &= (df["throttle_pct"] <= closed_thr)
+                if "acceleration_g" in df.columns:
+                    decel_cand &= (df["acceleration_g"] < 0.0)
+                elif "map_kpa" in df.columns:
+                    decel_cand &= (df["map_kpa"] <= 35.0)
+
+                inactive_rows = df[decel_cand & (~df["is_dfco"])]
+                if not inactive_rows.empty:
+                    if "coolant_temp_c" in inactive_rows.columns:
+                        coolant_inhibit_count += int(np.sum(inactive_rows["coolant_temp_c"] < 70.0))
+                    if "throttle_pct" in inactive_rows.columns:
+                        throttle_margin_count += int(np.sum(inactive_rows["throttle_pct"] > min_thr + 0.5))
+                    if "o2_voltage_v" in inactive_rows.columns:
+                        speed_density_artifact_count += int(np.sum(inactive_rows["o2_voltage_v"] <= 0.18))
+                    if "engine_rpm" in inactive_rows.columns:
+                        low_rpm_count += int(np.sum(inactive_rows["engine_rpm"] < 1300.0))
+
+        if total_eligible == 0:
+            return DFCOAnalysisResult(
+                has_data=True,
+                status="[NO OVERRUN]",
+                diagnostic_summary="No high-speed deceleration or overrun coasting events detected in selected records.",
+            )
+
+        pct = (total_active / total_eligible * 100.0) if total_eligible > 0 else 0.0
+
+        if pct >= 80.0:
+            status = "[OPTIMAL]"
+        elif pct >= 45.0:
+            status = "[GOOD]"
+        elif pct >= 15.0:
+            status = "[PARTIAL]"
+        else:
+            status = "[INACTIVE]"
+
+        reasons = []
+        recommendations = []
+
+        if coolant_inhibit_count > 5:
+            reasons.append(f"Engine Warm-Up Delay: {coolant_inhibit_count} overrun seconds occurred before coolant reached 70 C operating temperature.")
+            recommendations.append("Verify thermostat opening temperature and warm-up time. Avoid aggressive driving before engine reaches full operating temperature.")
+
+        if throttle_margin_count > 10:
+            reasons.append(f"Throttle Closed Baseline Variance: {throttle_margin_count} overrun seconds logged throttle slightly above resting idle threshold.")
+            recommendations.append("Inspect throttle body for carbon deposits, check throttle cable slack, and calibrate Throttle Position Sensor (TPS) resting voltage.")
+
+        if speed_density_artifact_count > 10:
+            reasons.append(f"OBD Speed-Density Synthetic Fuel Estimation: {speed_density_artifact_count} overrun seconds logged lean O2 exhaust (<= 0.18V) while scanner computed synthetic MAP fuel rate.")
+            recommendations.append("The ECU is actively cutting fuel injection, but the OBD-II protocol computes fuel rate via speed-density equations rather than direct injector pulse width.")
+
+        if low_rpm_count > 10:
+            reasons.append(f"Low Overrun Engine Speed: {low_rpm_count} overrun seconds had engine speed near the 1100-1300 RPM stall recovery threshold.")
+            recommendations.append("Downshift earlier or maintain transmission in drive during deceleration to allow higher overrun RPM for fuel cut-off.")
+
+        if not reasons and pct < 50.0:
+            reasons.append("ECU Overrun Fuel Delivery: Engine continuously delivers idle or sub-idle fuel during deceleration rather than engaging full injector shutoff.")
+            recommendations.append("Check vehicle tune, transmission torque converter lockup status, and verify if ECU supports deceleration fuel shutoff on this firmware.")
+
+        if pct >= 80.0:
+            diag_sum = f"DFCO engaged reliably across {pct:.1f}% of eligible deceleration events, conserving an estimated {total_fuel_saved:.2f} L of fuel."
+        elif pct >= 45.0:
+            diag_sum = f"DFCO engaged moderately across {pct:.1f}% of eligible deceleration events ({total_active:.0f}s active vs {total_inactive:.0f}s inactive). Conserved {total_fuel_saved:.2f} L of fuel."
+        else:
+            diag_sum = f"DFCO engagement is low or absent ({pct:.1f}% engagement, {total_inactive:.0f}s missed cut-offs). Engine continues injecting fuel during deceleration."
+
+        return DFCOAnalysisResult(
+            has_data=True,
+            eligible_decel_seconds=total_eligible,
+            active_dfco_seconds=total_active,
+            inactive_dfco_seconds=total_inactive,
+            dfco_engagement_pct=pct,
+            fuel_saved_liters=total_fuel_saved,
+            status=status,
+            primary_inhibit_reasons=reasons,
+            diagnostic_summary=diag_sum,
+            mechanic_recommendations=recommendations,
+        )
+
     def compute_optimal_fuel_economy_rpm_speed_curve(
         self, trips: List[ScanTrip], speed_step: float = 5.0, rpm_step: float = 100.0
     ) -> Dict[str, Any]:
-        """Compute optimal fuel economy (km/L) surface as a function of RPM and Speed."""
+        """Compute optimal real-world fuel economy surface as a function of RPM and Speed using ML road load regression."""
         combined = self.extract_moving_dataset(trips)
+        dfco_res = self.analyze_dfco(trips)
         empty_res = {
             "has_data": False,
             "speed_bins": np.array([]),
@@ -378,6 +505,12 @@ class VehicleAnalyzer:
             "scatter_speed": np.array([]),
             "scatter_rpm": np.array([]),
             "scatter_fe": np.array([]),
+            "coasting_speed": np.array([]),
+            "coasting_rpm": np.array([]),
+            "coasting_fe": np.array([]),
+            "ml_curve_speed": np.array([]),
+            "ml_curve_fe": np.array([]),
+            "dfco_result": dfco_res,
         }
 
         if combined.empty or "engine_rpm" not in combined.columns:
@@ -395,16 +528,78 @@ class VehicleAnalyzer:
         rpm = combined["engine_rpm"].values
         fe_val = fe.values
 
-        valid = (speed > 5.0) & (rpm > 500) & (fe_val > 1.0) & (fe_val < 60.0)
-        s = speed[valid]
-        r = rpm[valid]
-        f = fe_val[valid]
+        # Determine tractive cruising points vs coasting/overrun/DFCO points
+        min_thr = float(combined["throttle_pct"].min()) if "throttle_pct" in combined.columns else 11.4
+        closed_thr = min_thr + 1.5
 
-        if len(s) < 30:
+        if "is_tractive" in combined.columns:
+            tractive_mask = combined["is_tractive"].values.copy()
+        else:
+            tractive_mask = ((speed > 5.0) & (rpm > 500) & (fe_val > 0.5) & (fe_val <= 28.0)).copy()
+            if "throttle_pct" in combined.columns:
+                tractive_mask = tractive_mask & (combined["throttle_pct"].values > closed_thr)
+            if "acceleration_g" in combined.columns:
+                tractive_mask = tractive_mask & (combined["acceleration_g"].values >= -0.05)
+
+        # Level-road tractive propulsion filter (filters out slight downhill overrun where speed > 50 and decel is negative)
+        if "acceleration_g" in combined.columns:
+            downhill_overrun = (speed > 50.0) & (combined["acceleration_g"].values < -0.005)
+            if "map_kpa" in combined.columns:
+                downhill_overrun = downhill_overrun & (combined["map_kpa"].values < 45.0)
+            tractive_mask = tractive_mask & (~downhill_overrun)
+
+        # Overrun / coasting / DFCO points
+        coasting_mask = (speed > 10.0) & (~tractive_mask) & (fe_val > 1.0) & (fe_val < 100.0)
+
+        # Use tractive points if sufficient; fallback to general valid points if dataset is sparse
+        if np.sum(tractive_mask) >= 30:
+            active_s = speed[tractive_mask]
+            active_r = rpm[tractive_mask]
+            active_f = fe_val[tractive_mask]
+        else:
+            valid = (speed > 5.0) & (rpm > 500) & (fe_val > 1.0) & (fe_val < 35.0)
+            active_s = speed[valid]
+            active_r = rpm[valid]
+            active_f = fe_val[valid]
+
+        if len(active_s) < 30:
             return empty_res
 
-        s_min, s_max = 10.0, float(min(125.0, np.max(s) + 5.0))
-        r_min, r_max = 700.0, float(min(4500.0, np.max(r) + 100.0))
+        # ML Road Load Regression Model (HuberRegressor)
+        # Learn Fuel Rate = c0 + c1*v + c2*(v/100)^3 from steady-state cruising
+        ml_curve_speed = np.array([])
+        ml_curve_fe = np.array([])
+        road_load_model = None
+
+        if "fuel_rate_lh" in combined.columns or "fuel_economy_kml" in combined.columns:
+            if "fuel_rate_lh" in combined.columns:
+                fr_all = combined["fuel_rate_lh"].values
+            else:
+                fr_all = speed / np.where(fe_val > 0, fe_val, np.nan)
+
+            steady_mask = tractive_mask & (speed >= 15.0) & (fr_all > 0.4) & (fe_val <= 25.0)
+            if "acceleration_g" in combined.columns:
+                steady_mask &= (combined["acceleration_g"].values >= -0.04) & (combined["acceleration_g"].values <= 0.05)
+
+            v_train = speed[steady_mask]
+            fr_train = fr_all[steady_mask]
+
+            if len(v_train) >= 20:
+                try:
+                    X_train = np.column_stack([np.ones_like(v_train), v_train, (v_train / 100.0) ** 3])
+                    road_load_model = HuberRegressor(fit_intercept=False, max_iter=200).fit(X_train, fr_train)
+
+                    s_min_val = float(max(15.0, np.percentile(v_train, 1)))
+                    s_max_val = float(min(130.0, np.percentile(v_train, 99) + 5.0))
+                    ml_curve_speed = np.linspace(s_min_val, s_max_val, 80)
+                    X_pred = np.column_stack([np.ones_like(ml_curve_speed), ml_curve_speed, (ml_curve_speed / 100.0) ** 3])
+                    pred_fr = np.maximum(road_load_model.predict(X_pred), 0.5)
+                    ml_curve_fe = ml_curve_speed / pred_fr
+                except Exception:
+                    road_load_model = None
+
+        s_min, s_max = 10.0, float(min(125.0, np.max(active_s) + 5.0))
+        r_min, r_max = 700.0, float(min(4500.0, np.max(active_r) + 100.0))
 
         s_bins = np.arange(s_min, s_max + speed_step, speed_step)
         r_bins = np.arange(r_min, r_max + rpm_step, rpm_step)
@@ -413,13 +608,13 @@ class VehicleAnalyzer:
 
         for i in range(len(s_bins) - 1):
             s_low, s_high = s_bins[i], s_bins[i + 1]
-            s_mask = (s >= s_low) & (s < s_high)
+            s_mask = (active_s >= s_low) & (active_s < s_high)
             for j in range(len(r_bins) - 1):
                 r_low, r_high = r_bins[j], r_bins[j + 1]
-                cell_mask = s_mask & (r >= r_low) & (r < r_high)
+                cell_mask = s_mask & (active_r >= r_low) & (active_r < r_high)
                 count = int(np.sum(cell_mask))
                 if count >= 3:
-                    matrix[j, i] = float(np.median(f[cell_mask]))
+                    matrix[j, i] = float(np.median(active_f[cell_mask]))
 
         opt_speed = []
         opt_rpm = []
@@ -427,14 +622,21 @@ class VehicleAnalyzer:
 
         for i in range(len(s_bins) - 1):
             s_center = 0.5 * (s_bins[i] + s_bins[i + 1])
-            s_mask = (s >= s_bins[i]) & (s < s_bins[i + 1])
-            if np.sum(s_mask) >= 8:
-                sub_r = r[s_mask]
-                sub_f = f[s_mask]
-                top_cutoff = np.percentile(sub_f, 75)
+            s_mask = (active_s >= s_bins[i]) & (active_s < s_bins[i + 1])
+            if np.sum(s_mask) >= 6:
+                sub_r = active_r[s_mask]
+                sub_f = active_f[s_mask]
+                top_cutoff = np.percentile(sub_f, 60)
                 top_mask = sub_f >= top_cutoff
                 best_rpm = float(np.median(sub_r[top_mask]))
-                best_fe = float(np.mean(sub_f[top_mask]))
+                best_fe = float(np.median(sub_f[top_mask]))
+
+                if road_load_model is not None:
+                    X_bin = np.array([[1.0, s_center, (s_center / 100.0) ** 3]])
+                    ml_bin_fr = max(float(road_load_model.predict(X_bin)[0]), 0.5)
+                    ml_bin_fe = s_center / ml_bin_fr
+                    best_fe = float(0.6 * best_fe + 0.4 * ml_bin_fe)
+
                 opt_speed.append(s_center)
                 opt_rpm.append(best_rpm)
                 opt_fe.append(best_fe)
@@ -454,6 +656,7 @@ class VehicleAnalyzer:
                 "speed_kmh": opt_speed[best_idx],
                 "rpm": opt_rpm[best_idx],
                 "fe_kml": opt_fe[best_idx],
+                "is_ml_modeled": (road_load_model is not None),
             }
 
         return {
@@ -466,9 +669,15 @@ class VehicleAnalyzer:
             "opt_rpm": np.array(opt_rpm),
             "opt_fe": np.array(opt_fe),
             "sweet_spot": sweet_spot,
-            "scatter_speed": s,
-            "scatter_rpm": r,
-            "scatter_fe": f,
+            "scatter_speed": active_s,
+            "scatter_rpm": active_r,
+            "scatter_fe": active_f,
+            "coasting_speed": speed[coasting_mask],
+            "coasting_rpm": rpm[coasting_mask],
+            "coasting_fe": fe_val[coasting_mask],
+            "ml_curve_speed": ml_curve_speed,
+            "ml_curve_fe": ml_curve_fe,
+            "dfco_result": dfco_res,
         }
 
     def analyze_coolant_temperature(self, trips: List[ScanTrip]) -> Dict[str, Any]:

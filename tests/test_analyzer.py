@@ -16,6 +16,7 @@ from src.data_loader import parse_obd_csv, load_all_records, clean_raw_obd_data
 from src.analyzer import (
     VehicleAnalyzer,
     FuelEconomyResult,
+    DFCOAnalysisResult,
     DiagnosticHealthReport,
     FuelTrimDiagnostic,
     HybridBatteryReport,
@@ -125,6 +126,23 @@ class TestVehicleAnalyzer(unittest.TestCase):
         self.assertGreater(sp["speed_kmh"], 20.0)
         self.assertGreater(sp["rpm"], 600.0)
         self.assertGreater(sp["fe_kml"], 5.0)
+        # Verify realistic fuel economy bound under tractive cruise (max < 25.0 km/L)
+        self.assertLess(sp["fe_kml"], 25.0)
+        self.assertIn("ml_curve_speed", fe_map)
+        self.assertIn("ml_curve_fe", fe_map)
+        self.assertIn("dfco_result", fe_map)
+
+    def test_dfco_diagnostics_and_detection(self):
+        dfco_res = self.analyzer.analyze_dfco(self.trips)
+        self.assertTrue(dfco_res.has_data)
+        self.assertGreater(dfco_res.eligible_decel_seconds, 0)
+        self.assertGreater(dfco_res.active_dfco_seconds, 0)
+        self.assertGreater(dfco_res.inactive_dfco_seconds, 0)
+        self.assertGreater(dfco_res.dfco_engagement_pct, 0.0)
+        self.assertLessEqual(dfco_res.dfco_engagement_pct, 100.0)
+        self.assertGreater(dfco_res.fuel_saved_liters, 0.0)
+        self.assertIn(dfco_res.status, ["[OPTIMAL]", "[GOOD]", "[PARTIAL]", "[INACTIVE]"])
+        self.assertTrue(len(dfco_res.diagnostic_summary) > 0)
 
     def test_coolant_thermal_analysis(self):
         thermal = self.analyzer.analyze_coolant_temperature(self.trips)

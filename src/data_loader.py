@@ -100,6 +100,10 @@ class DataCleanupReport:
     sensor_outliers_cleaned: int = 0
     duplicate_rows_dropped: int = 0
     dfco_events_conditioned: int = 0
+    dfco_eligible_events: int = 0
+    dfco_active_events: int = 0
+    dfco_inactive_events: int = 0
+    fuel_saved_liters: float = 0.0
 
 
 @dataclass
@@ -259,6 +263,11 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
     if "engine_rpm" in aligned_df.columns:
         aligned_df["engine_rpm"] = aligned_df["engine_rpm"].clip(lower=0.0)
 
+    # Compute vehicle acceleration (in g) if not directly supplied by sensor log
+    if "acceleration_g" not in aligned_df.columns and "speed_kmh" in aligned_df.columns:
+        dv_ms = (aligned_df["speed_kmh"].diff() * (1000.0 / 3600.0)) / grid_step_seconds
+        aligned_df["acceleration_g"] = (dv_ms / 9.80665).fillna(0.0)
+
     # Reconstruct fuel rate / fuel economy cross-metrics
     if "fuel_rate_lh" not in aligned_df.columns and "fuel_economy_kml" in aligned_df.columns and "speed_kmh" in aligned_df.columns:
         speed = aligned_df["speed_kmh"]
@@ -270,10 +279,59 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
         fr = aligned_df["fuel_rate_lh"].replace(0, np.nan)
         aligned_df["fuel_economy_kml"] = (speed / fr).fillna(0.0)
 
-    # Deceleration fuel cut-off (DFCO) conditioning
+    # Deceleration fuel cut-off (DFCO) conditioning and tractive driving mode classification
+    min_thr = float(aligned_df["throttle_pct"].min()) if "throttle_pct" in aligned_df.columns else 11.4
+    closed_thr = min_thr + 1.5
+
+    # Overrun deceleration criteria (DFCO eligibility)
+    decel_cand = pd.Series(False, index=aligned_df.index)
+    if "speed_kmh" in aligned_df.columns and "engine_rpm" in aligned_df.columns:
+        decel_cand = (aligned_df["speed_kmh"] >= 15.0) & (aligned_df["engine_rpm"] >= 1100.0)
+        if "throttle_pct" in aligned_df.columns:
+            decel_cand &= (aligned_df["throttle_pct"] <= closed_thr)
+        if "acceleration_g" in aligned_df.columns:
+            decel_cand &= (aligned_df["acceleration_g"] < 0.0)
+        elif "map_kpa" in aligned_df.columns:
+            decel_cand &= (aligned_df["map_kpa"] <= 35.0)
+
+    # Active fuel cut vs inactive fuel delivery during overrun
+    active_cut = decel_cand.copy()
+    if "fuel_rate_lh" in aligned_df.columns or "fuel_economy_kml" in aligned_df.columns:
+        cut_crit = pd.Series(False, index=aligned_df.index)
+        if "fuel_rate_lh" in aligned_df.columns:
+            cut_crit |= (aligned_df["fuel_rate_lh"] <= 0.15)
+        if "fuel_economy_kml" in aligned_df.columns:
+            cut_crit |= (aligned_df["fuel_economy_kml"] >= 35.0)
+        if "o2_voltage_v" in aligned_df.columns:
+            cut_crit |= (aligned_df["o2_voltage_v"] <= 0.15)
+        active_cut &= cut_crit
+
+    inactive_cut = decel_cand & (~active_cut)
+
+    aligned_df["is_dfco"] = active_cut
+    if "fuel_rate_lh" in aligned_df.columns:
+        aligned_df.loc[active_cut, "fuel_rate_lh"] = 0.0
+
+    cleanup_report.dfco_eligible_events = int(np.sum(decel_cand))
+    cleanup_report.dfco_active_events = int(np.sum(active_cut))
+    cleanup_report.dfco_inactive_events = int(np.sum(inactive_cut))
+    cleanup_report.dfco_events_conditioned = cleanup_report.dfco_active_events
+    cleanup_report.fuel_saved_liters = float(cleanup_report.dfco_active_events) * (1.1 / 3600.0)
+
+    # Tractive propulsion classification (positive load / cruise / acceleration)
+    is_tractive = pd.Series(True, index=aligned_df.index)
+    if "speed_kmh" in aligned_df.columns:
+        is_tractive &= (aligned_df["speed_kmh"] >= 5.0)
+    is_tractive &= (~decel_cand)
+    if "throttle_pct" in aligned_df.columns:
+        is_tractive &= (aligned_df["throttle_pct"] > closed_thr)
+    if "acceleration_g" in aligned_df.columns:
+        is_tractive &= (aligned_df["acceleration_g"] >= -0.05)
+    if "fuel_rate_lh" in aligned_df.columns:
+        is_tractive &= (aligned_df["fuel_rate_lh"] > 0.4)
     if "fuel_economy_kml" in aligned_df.columns:
-        dfco_mask = aligned_df["fuel_economy_kml"] > 60.0
-        cleanup_report.dfco_events_conditioned = int(np.sum(dfco_mask))
+        is_tractive &= (aligned_df["fuel_economy_kml"] >= 0.5) & (aligned_df["fuel_economy_kml"] <= 28.0)
+    aligned_df["is_tractive"] = is_tractive
 
     # Convert battery current from mA to A if present
     if "hv_current_ma" in aligned_df.columns:

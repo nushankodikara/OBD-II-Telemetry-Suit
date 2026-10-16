@@ -434,7 +434,32 @@ class CarRecordAnalyzerApp(ctk.CTk):
         self.tab_hybrid = None
         self.canvas_hybrid = None
 
-        # Tab 1: Efficiency Canvas
+        # Tab 1: Efficiency Canvas with DFCO & Mode Controls
+        self.fe_controls_bar = ctk.CTkFrame(self.tab_fe_map, fg_color="transparent", height=32)
+        self.fe_controls_bar.pack(fill="x", padx=8, pady=(4, 2))
+
+        self.lbl_fe_dfco_status = ctk.CTkLabel(
+            self.fe_controls_bar,
+            text="DFCO Status: Standby",
+            font=FONT_CAPTION,
+            text_color=TEXT_SECONDARY,
+        )
+        self.lbl_fe_dfco_status.pack(side="left", padx=4)
+
+        self.fe_mode_seg = ctk.CTkSegmentedButton(
+            self.fe_controls_bar,
+            values=["Real-World Tractive", "Show All (Incl. DFCO / Coasting)"],
+            font=FONT_CAPTION,
+            selected_color=ACCENT_CYAN,
+            selected_hover_color=ACCENT_CYAN,
+            unselected_color=BG_PANEL_ALT,
+            unselected_hover_color=BG_CARD_HOVER,
+            command=self._on_fe_mode_changed,
+        )
+        self.fe_mode_seg.set("Real-World Tractive")
+        self.fe_mode_seg.pack(side="right", padx=4)
+        self.fe_display_mode_val = "tractive"
+
         self.canvas_fe_map = GraphCanvas(self.tab_fe_map)
         self.canvas_fe_map.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -1217,6 +1242,14 @@ class CarRecordAnalyzerApp(ctk.CTk):
         self._populate_trip_table()
         self._persist_session()
 
+    def _on_fe_mode_changed(self, mode_str: str):
+        """Callback when user toggles fuel economy plot mode."""
+        if "All" in mode_str:
+            self.fe_display_mode_val = "all"
+        else:
+            self.fe_display_mode_val = "tractive"
+        self._render_fe_map_graph()
+
     def _open_thresholds_dialog(self):
         """Dialog to adjust city and highway speed boundaries."""
         dlg = ctk.CTkToplevel(self)
@@ -1555,11 +1588,13 @@ class CarRecordAnalyzerApp(ctk.CTk):
                 "SWEET SPOT",
             )
 
-        ax1.set_title("Fuel Economy Heatmap (Speed vs RPM)", fontsize=11, fontweight="bold", pad=8)
+        ax1.set_title("Fuel Economy Heatmap (Speed vs RPM) [Tractive Cruise]", fontsize=11, fontweight="bold", pad=8)
         ax1.set_xlabel("Vehicle Speed (km/h)", fontsize=10)
         ax1.set_ylabel("Engine RPM (rpm)", fontsize=10)
         ax1.grid(True, linestyle="--", alpha=0.3)
         ax1.legend(loc="upper left", fontsize=8)
+
+        display_mode = getattr(self, "fe_display_mode_val", "tractive")
 
         scatter_s = fe_map["scatter_speed"]
         scatter_fe = fe_map["scatter_fe"].copy()
@@ -1570,16 +1605,61 @@ class CarRecordAnalyzerApp(ctk.CTk):
         elif unit == "MPG (UK)":
             scatter_fe = scatter_fe * 2.82480936
 
+        # When requested, display raw deceleration, downhill overrun, and DFCO spikes faintly
+        if display_mode == "all" and "coasting_speed" in fe_map and len(fe_map["coasting_speed"]) > 0:
+            c_s = fe_map["coasting_speed"]
+            c_fe = fe_map["coasting_fe"].copy()
+            if unit == "L/100km":
+                c_fe = 100.0 / np.where(c_fe > 0, c_fe, np.nan)
+            elif unit == "MPG (US)":
+                c_fe = c_fe * 2.35214583
+            elif unit == "MPG (UK)":
+                c_fe = c_fe * 2.82480936
+
+            c_sub = np.random.choice(len(c_s), min(800, len(c_s)), replace=False)
+            ax2.scatter(
+                c_s[c_sub],
+                c_fe[c_sub],
+                color="#64748B",
+                alpha=0.18,
+                s=10,
+                marker="x",
+                label="DFCO / Overrun Spikes",
+                zorder=2,
+            )
+
         sub_idx = np.random.choice(len(scatter_s), min(1200, len(scatter_s)), replace=False)
         ax2.scatter(
             scatter_s[sub_idx],
             scatter_fe[sub_idx],
             color=ACCENT_CYAN,
-            alpha=0.25,
+            alpha=0.30,
             s=12,
             edgecolors="none",
-            label="Sampled Points",
+            label="Real-World Tractive Cruise",
+            zorder=3,
         )
+
+        # Machine Learning Road Load Steady-State Cruise Model Curve
+        ml_s = fe_map.get("ml_curve_speed")
+        ml_fe = fe_map.get("ml_curve_fe")
+        if ml_s is not None and len(ml_s) > 0 and ml_fe is not None and len(ml_fe) > 0:
+            ml_fe_disp = ml_fe.copy()
+            if unit == "L/100km":
+                ml_fe_disp = 100.0 / ml_fe_disp
+            elif unit == "MPG (US)":
+                ml_fe_disp = ml_fe_disp * 2.35214583
+            elif unit == "MPG (UK)":
+                ml_fe_disp = ml_fe_disp * 2.82480936
+
+            ax2.plot(
+                ml_s,
+                ml_fe_disp,
+                color=ACCENT_AMBER,
+                linewidth=2.8,
+                label="ML Steady Cruise Model",
+                zorder=5,
+            )
 
         if len(opt_s) > 0:
             opt_fe_arr = fe_map["opt_fe"].copy()
@@ -1593,10 +1673,13 @@ class CarRecordAnalyzerApp(ctk.CTk):
             ax2.plot(
                 opt_s,
                 opt_fe_arr,
-                color=ACCENT_AMBER,
-                linewidth=2.5,
+                color="#FFFFFF",
+                linewidth=1.8,
+                linestyle="--",
                 marker="o",
-                label="Peak Efficiency Envelope",
+                markersize=4,
+                label="Peak Operating Envelope",
+                zorder=6,
             )
 
         ax2.axvline(self.city_threshold, color="#3B82F6", linestyle="--", alpha=0.6, label=f"City Limit ({self.city_threshold:.0f} km/h)")
@@ -1607,6 +1690,17 @@ class CarRecordAnalyzerApp(ctk.CTk):
         ax2.set_ylabel(f"Fuel Economy ({unit})", fontsize=10)
         ax2.grid(True, linestyle="--", alpha=0.3)
         ax2.legend(loc="upper right", fontsize=8)
+
+        # Update DFCO status bar in Tab 1
+        dfco_info = fe_map.get("dfco_result")
+        if dfco_info and hasattr(self, "lbl_fe_dfco_status"):
+            self.lbl_fe_dfco_status.configure(
+                text=(
+                    f"DFCO Status: {dfco_info.status}   |   "
+                    f"Engagement: {dfco_info.dfco_engagement_pct:.1f}% ({dfco_info.active_dfco_seconds:.0f}s active / {dfco_info.eligible_decel_seconds:.0f}s eligible)   |   "
+                    f"Fuel Saved: {dfco_info.fuel_saved_liters:.2f} L"
+                )
+            )
 
         canvas.draw()
 
@@ -2001,14 +2095,17 @@ class CarRecordAnalyzerApp(ctk.CTk):
         invalid_dropped = sum(t.cleanup_report.invalid_rows_dropped for t in trips)
         outliers = sum(t.cleanup_report.sensor_outliers_cleaned for t in trips)
         dfco_events = sum(t.cleanup_report.dfco_events_conditioned for t in trips)
+        dfco_eligible = sum(t.cleanup_report.dfco_eligible_events for t in trips)
+        dfco_fuel_saved = sum(t.cleanup_report.fuel_saved_liters for t in trips)
+        dfco_pct = (dfco_events / dfco_eligible * 100.0) if dfco_eligible > 0 else 0.0
 
         self.lbl_cleanup_details.configure(
             text=(
                 f"Total Raw Rows: {total_raw:,}   |   "
                 f"Valid Rows Retained: {valid_retained:,}   |   "
                 f"Dropped/Sanitized: {invalid_dropped:,}   |   "
-                f"Sensor Outliers Sanitized: {outliers}   |   "
-                f"DFCO Spikes Conditioned: {dfco_events}"
+                f"DFCO Cut Engagement: {dfco_pct:.1f}% ({dfco_events:,}s active / {dfco_eligible:,}s eligible)   |   "
+                f"Fuel Cut Saved: {dfco_fuel_saved:.2f} L"
             )
         )
 
@@ -2139,6 +2236,25 @@ class CarRecordAnalyzerApp(ctk.CTk):
                 f.write(f"City Fuel Economy:     {fe.format_value('city', 'km/L')} km/L ({fe.format_value('city', 'L/100km')} L/100km | {fe.format_value('city', 'MPG (US)')} MPG US)\n")
                 f.write(f"Highway Fuel Economy:  {fe.format_value('highway', 'km/L')} km/L ({fe.format_value('highway', 'L/100km')} L/100km | {fe.format_value('highway', 'MPG (US)')} MPG US)\n")
                 f.write(f"Combined Fuel Economy: {fe.format_value('combined', 'km/L')} km/L ({fe.format_value('combined', 'L/100km')} L/100km | {fe.format_value('combined', 'MPG (US)')} MPG US)\n\n")
+
+                dfco_res = self.analyzer.analyze_dfco(trips)
+                f.write("--- DECELERATION FUEL CUT-OFF (DFCO) DIAGNOSTICS ---\n")
+                f.write(f"DFCO Overall Status:      {dfco_res.status}\n")
+                f.write(f"DFCO Engagement Rate:     {dfco_res.dfco_engagement_pct:.1f}%\n")
+                f.write(f"Active Cut Duration:      {dfco_res.active_dfco_seconds:.0f} s\n")
+                f.write(f"Eligible Overrun Decel:   {dfco_res.eligible_decel_seconds:.0f} s\n")
+                f.write(f"Inactive Overrun Decel:   {dfco_res.inactive_dfco_seconds:.0f} s\n")
+                f.write(f"Estimated Fuel Conserved: {dfco_res.fuel_saved_liters:.3f} L\n")
+                f.write(f"Summary: {dfco_res.diagnostic_summary}\n")
+                if dfco_res.primary_inhibit_reasons:
+                    f.write("\nDiagnostic Observations & Inhibit Factors:\n")
+                    for reason in dfco_res.primary_inhibit_reasons:
+                        f.write(f"- {reason}\n")
+                if dfco_res.mechanic_recommendations:
+                    f.write("\nMechanic Action Recommendations:\n")
+                    for rec in dfco_res.mechanic_recommendations:
+                        f.write(f"- {rec}\n")
+                f.write("\n")
 
                 if hyb and hyb.is_hybrid:
                     f.write("--- HYBRID POWERTRAIN & HIGH-VOLTAGE BATTERY HEALTH ---\n")

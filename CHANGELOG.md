@@ -8,6 +8,28 @@ Software is currently in beta status using the `0.x.x` versioning convention.
 
 Strict Project Requirement: Zero emojis are used across this changelog and entire repository.
 
+## [0.3.0-beta] - 2026-10-16
+
+### Added
+- Deceleration Fuel Cut-Off (DFCO) Analysis Engine (`analyze_dfco()` in `src/analyzer.py` and `DFCOAnalysisResult` dataclass):
+  - Added multi-condition DFCO eligibility classification based on vehicle speed, engine RPM, closed throttle baseline margin, manifold vacuum, and vehicle deceleration.
+  - Added detection of active fuel cut-off vs missed/inactive cut-off events (where fuel injection continues during eligible deceleration).
+  - Added automated root-cause diagnostics for inactive DFCO: engine warm-up temperature delay, closed throttle switch/cable variance, speed-density OBD synthetic fuel estimation, and low overrun engine speed.
+  - Added fuel savings calculation estimating total liters conserved by active DFCO fuel shutoff.
+  - Added dedicated DFCO diagnostic reporting in both the UI status bar and exported diagnostic reports.
+- Machine Learning Road Load Steady-State Cruise Model:
+  - Integrated Scikit-Learn `HuberRegressor` robust regression to learn physical road load coefficients ($FR(v) = c_0 + c_1 \cdot v + c_2 \cdot (v/100)^3$) from level-road tractive cruising data.
+  - Plotted smooth, physically grounded ML steady-state cruise efficiency curve directly on the Fuel Economy vs Speed chart.
+  - Added interactive segmented control in the Fuel Economy tab allowing instant switching between `Real-World Tractive` and `Show All (Incl. DFCO / Coasting)` views.
+- Added comprehensive unit tests for DFCO diagnostics and real-world fuel economy limits in `tests/test_analyzer.py`.
+
+### Changed
+- Refined `compute_optimal_fuel_economy_rpm_speed_curve()` to separate positive tractive cruising propulsion from overrun coasting and DFCO spikes.
+- Filtered 2D Fuel Economy Heatmap (Speed vs RPM) strictly to tractive cruising telemetry, eliminating misleading 35-48 km/L deceleration artifacts from the efficiency matrix.
+- Re-anchored the Peak Operating Envelope and Optimal Sweet Spot to real-world level-road cruising efficiency (e.g. 75 km/h @ ~1950 RPM, ~15.3 km/L for 2.2L naturally aspirated petrol vehicles).
+- Updated top banner `Optimal Efficiency Spot` gauge card to reflect realistic propulsive cruising sweet spots.
+- Updated Pre-Ingestion Data Cleanup audit card to display DFCO engagement percentage, active cut seconds, and conserved fuel liters.
+
 ---
 
 ## [0.2.0-beta] - 2026-10-16
