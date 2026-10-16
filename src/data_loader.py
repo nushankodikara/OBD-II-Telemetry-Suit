@@ -2,7 +2,8 @@
 
 Exclusively supports Car Scanner ELM OBD2 app's vertical export CSV format.
 Performs thorough multi-stage data cleanup, sensor bounds validation,
-GPS teleportation jump filtering, and time synchronization onto a uniform grid.
+and time synchronization onto a uniform grid.
+Supports hybrid vehicle telemetry (HV battery, block voltages, inverter, MG1/MG2).
 Strictly adheres to project rules: no emojis.
 """
 
@@ -16,6 +17,7 @@ import numpy as np
 
 # Standardized internal metric names mapped from Car Scanner ELM OBD2 PID descriptions
 PID_MAP = {
+    # Speed & Engine Dynamics
     "Vehicle speed": "speed_kmh",
     "Engine RPM": "engine_rpm",
     "Engine RPM x1000": "engine_rpm_k",
@@ -31,6 +33,7 @@ PID_MAP = {
     "Short term fuel % trim - Bank 1": "stft_pct",
     "Long term fuel % trim - Bank 1": "ltft_pct",
     "OBD Module Voltage": "voltage_v",
+    "BATTERY VOLTAGE 12 V": "voltage_v",
     "Oxygen sensor 1 Bank 1 Voltage": "o2_voltage_v",
     "Oxygen sensor 1 Bank 1 Short term fuel trim": "o2_stft_pct",
     "Distance travelled": "distance_km",
@@ -39,7 +42,35 @@ PID_MAP = {
     "Average fuel consumption": "avg_fc_kml",
     "Vehicle acceleration": "acceleration_g",
     "Instant engine power (based on fuel consumption)": "engine_power_hp",
+
+    # Hybrid Vehicle Telemetry (Toyota / Lexus THS-II & General HEV)
+    "State of Charge": "hv_soc_pct",
+    "State of Charge (All Bat)": "hv_soc_pct",
+    "Hybrid/EV battery pack remaining charge": "hv_soc_pct",
+    "Delta SOC": "hv_delta_soc_pct",
+    "Batt Pack Current Val": "hv_current_ma",
+    "Battery block maximum voltage": "hv_block_max_v",
+    "Battery block minimum voltage": "hv_block_min_v",
+    "Battery block number with maximum voltage": "hv_block_max_num",
+    "Battery block number with minimum voltage": "hv_block_min_num",
+    "Temp of Batt TB1": "hv_batt_temp_c",
+    "Temp of Batt TB2": "hv_batt_temp_tb2_c",
+    "Temp of Batt TB3": "hv_batt_temp_tb3_c",
+    "HV battery intake air temperature": "hv_intake_temp_c",
+    "Inverter Coolant Temp": "inverter_temp_c",
+    "Inverter MG1 Temp": "inverter_mg1_temp_c",
+    "Inverter MG2 Temp": "inverter_mg2_temp_c",
+    "MG1 revolution": "mg1_rpm",
+    "MG2 revolution": "mg2_rpm",
+    "MG1 torque": "mg1_torque_nm",
+    "MG2 torque": "mg2_torque_nm",
+    "HV battery charge control (kW)": "hv_charge_kw",
+    "HV battery discharge control (kW)": "hv_discharge_kw",
 }
+
+# Add individual battery block voltage mappings V01 to V14
+for i in range(1, 15):
+    PID_MAP[f"Battery Block Voltage -V{i:02d}"] = f"hv_block_v{i:02d}"
 
 # Physical plausibility boundaries for automotive sensors
 SENSOR_BOUNDS = {
@@ -47,6 +78,7 @@ SENSOR_BOUNDS = {
     "Engine RPM": (0.0, 9000.0),
     "Engine coolant temperature": (-40.0, 140.0),
     "OBD Module Voltage": (6.0, 18.0),
+    "BATTERY VOLTAGE 12 V": (6.0, 18.0),
     "Calculated instant fuel rate": (0.0, 120.0),
     "Calculated instant fuel consumption": (0.0, 100.0),
     "Short term fuel % trim - Bank 1": (-100.0, 100.0),
@@ -54,6 +86,8 @@ SENSOR_BOUNDS = {
     "Intake manifold absolute pressure": (10.0, 300.0),
     "Throttle position": (0.0, 100.0),
     "Calculated engine load value": (0.0, 100.0),
+    "State of Charge": (0.0, 100.0),
+    "Hybrid/EV battery pack remaining charge": (0.0, 100.0),
 }
 
 
@@ -64,7 +98,6 @@ class DataCleanupReport:
     valid_rows_retained: int = 0
     invalid_rows_dropped: int = 0
     sensor_outliers_cleaned: int = 0
-    gps_jumps_filtered: int = 0
     duplicate_rows_dropped: int = 0
     dfco_events_conditioned: int = 0
 
@@ -80,9 +113,7 @@ class ScanTrip:
     data: pd.DataFrame
     cleanup_report: DataCleanupReport = field(default_factory=DataCleanupReport)
     pids_found: List[str] = field(default_factory=list)
-    has_gps: bool = False
-    latitude_start: Optional[float] = None
-    longitude_start: Optional[float] = None
+    is_hybrid: bool = False
 
     @property
     def duration_minutes(self) -> float:
@@ -113,25 +144,6 @@ class ScanTrip:
         if "voltage_v" in self.data.columns and not self.data["voltage_v"].dropna().empty:
             return float(self.data["voltage_v"].mean())
         return 0.0
-
-    @property
-    def gps_coordinates(self) -> List[Tuple[float, float]]:
-        """Extract ordered sequence of valid (latitude, longitude) pairs."""
-        if not self.has_gps or "latitude" not in self.data.columns or "longitude" not in self.data.columns:
-            return []
-        gps_valid = self.data.dropna(subset=["latitude", "longitude"])
-        # Subsample if excessively dense
-        coords = list(zip(gps_valid["latitude"].values, gps_valid["longitude"].values))
-        return coords
-
-
-def _haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate the great-circle distance between two GPS coordinates in kilometers."""
-    r_earth = 6371.0
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2.0) ** 2
-    return float(2.0 * r_earth * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
 
 
 def clean_raw_obd_data(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, DataCleanupReport]:
@@ -179,50 +191,6 @@ def clean_raw_obd_data(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, DataCleanupR
 
     report.sensor_outliers_cleaned = outlier_count
 
-    # Stage 5: Clean GPS coordinates and filter teleportation spikes
-    gps_jumps = 0
-    if "LATITUDE" in df.columns and "LONGTITUDE" in df.columns:
-        df["LATITUDE"] = pd.to_numeric(df["LATITUDE"], errors="coerce")
-        df["LONGTITUDE"] = pd.to_numeric(df["LONGTITUDE"], errors="coerce")
-
-        # Invalidate 0.0, 0.0 or out-of-bounds coordinates
-        invalid_gps = (
-            (df["LATITUDE"] == 0.0)
-            | (df["LONGTITUDE"] == 0.0)
-            | (df["LATITUDE"] < -90.0)
-            | (df["LATITUDE"] > 90.0)
-            | (df["LONGTITUDE"] < -180.0)
-            | (df["LONGTITUDE"] > 180.0)
-        )
-        df.loc[invalid_gps, ["LATITUDE", "LONGTITUDE"]] = np.nan
-
-        # Detect GPS jump anomalies (distance jumps exceeding 2 km between points)
-        valid_gps_idx = df.dropna(subset=["LATITUDE", "LONGTITUDE"]).index
-        if len(valid_gps_idx) > 1:
-            lats = df.loc[valid_gps_idx, "LATITUDE"].values
-            lons = df.loc[valid_gps_idx, "LONGTITUDE"].values
-            secs = df.loc[valid_gps_idx, "SECONDS"].values
-
-            prev_lat, prev_lon, prev_sec = lats[0], lons[0], secs[0]
-            drop_indices = []
-
-            for i in range(1, len(lats)):
-                dist = _haversine_distance_km(prev_lat, prev_lon, lats[i], lons[i])
-                dt = max(0.1, secs[i] - prev_sec)
-                implied_speed = (dist / dt) * 3600.0  # km/h
-
-                # If speed > 220 km/h or jump > 3 km, mark as glitch
-                if implied_speed > 220.0 or dist > 3.0:
-                    drop_indices.append(valid_gps_idx[i])
-                    gps_jumps += 1
-                else:
-                    prev_lat, prev_lon, prev_sec = lats[i], lons[i], secs[i]
-
-            if drop_indices:
-                df.loc[drop_indices, ["LATITUDE", "LONGTITUDE"]] = np.nan
-
-    report.gps_jumps_filtered = gps_jumps
-
     # Sort strictly by timestamp
     df = df.sort_values(by="SECONDS").reset_index(drop=True)
 
@@ -250,7 +218,7 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
     if raw_df.empty:
         return None
 
-    # Step 1: Execute deep pre-ingestion cleanup
+    # Step 1: Pre-ingestion cleanup
     cleaned_df, cleanup_report = clean_raw_obd_data(raw_df)
     if cleaned_df.empty:
         return None
@@ -261,44 +229,30 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
     max_sec = cleaned_df["SECONDS"].max()
     duration_seconds = max(0.0, float(max_sec - min_sec))
 
-    # Step 2: Check GPS availability
-    has_gps = False
-    lat_start = None
-    lon_start = None
-    if "LATITUDE" in cleaned_df.columns and "LONGTITUDE" in cleaned_df.columns:
-        valid_gps = cleaned_df.dropna(subset=["LATITUDE", "LONGTITUDE"])
-        if len(valid_gps) > 5:
-            has_gps = True
-            lat_start = float(valid_gps["LATITUDE"].iloc[0])
-            lon_start = float(valid_gps["LONGTITUDE"].iloc[0])
+    # Detect if hybrid vehicle based on PIDs
+    is_hybrid = any(
+        kw in p.lower()
+        for p in pids_found
+        for kw in ["hybrid", "hv ", "soc", "inverter", "mg1", "mg2", "block voltage"]
+    )
 
-    # Step 3: Map PIDs to canonical metrics
+    # Step 2: Map PIDs to canonical metrics
     cleaned_df["metric"] = cleaned_df["PID"].map(PID_MAP).fillna(cleaned_df["PID"])
     cleaned_df["elapsed_sec"] = cleaned_df["SECONDS"] - min_sec
     cleaned_df["t_bin"] = (cleaned_df["elapsed_sec"] / grid_step_seconds).round() * grid_step_seconds
 
-    # Step 4: Pivot sensor values
+    # Step 3: Pivot sensor values
     pivot_df = cleaned_df.pivot_table(index="t_bin", columns="metric", values="VALUE", aggfunc="mean")
 
-    # Step 5: Pivot and interpolate GPS coordinates if present
-    if has_gps:
-        gps_binned = (
-            cleaned_df.dropna(subset=["LATITUDE", "LONGTITUDE"])
-            .groupby("t_bin")[["LATITUDE", "LONGTITUDE"]]
-            .mean()
-        )
-        pivot_df["latitude"] = gps_binned["LATITUDE"]
-        pivot_df["longitude"] = gps_binned["LONGTITUDE"]
-
-    # Step 6: Uniform time grid reconstruction
+    # Step 4: Uniform time grid reconstruction
     uniform_index = np.arange(0, pivot_df.index.max() + grid_step_seconds, grid_step_seconds)
     aligned_df = pivot_df.reindex(uniform_index)
 
-    # Linear interpolation for telemetry
+    # Bounded linear interpolation for continuous telemetry
     aligned_df = aligned_df.interpolate(method="linear", limit=6).bfill().ffill()
     aligned_df.index.name = "elapsed_seconds"
 
-    # Step 7: Derived metric calculations & DFCO conditioning
+    # Step 5: Derived metric calculations & DFCO conditioning
     if "speed_kmh" in aligned_df.columns:
         aligned_df["speed_kmh"] = aligned_df["speed_kmh"].clip(lower=0.0)
 
@@ -318,9 +272,12 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
 
     # Deceleration fuel cut-off (DFCO) conditioning
     if "fuel_economy_kml" in aligned_df.columns:
-        # Flag spikes where fuel economy exceeds 60 km/L during coasting
         dfco_mask = aligned_df["fuel_economy_kml"] > 60.0
         cleanup_report.dfco_events_conditioned = int(np.sum(dfco_mask))
+
+    # Convert battery current from mA to A if present
+    if "hv_current_ma" in aligned_df.columns:
+        aligned_df["hv_current_a"] = aligned_df["hv_current_ma"] / 1000.0
 
     file_name = os.path.basename(file_path)
 
@@ -333,16 +290,18 @@ def parse_obd_csv(file_path: str, grid_step_seconds: float = 1.0) -> Optional[Sc
         data=aligned_df,
         cleanup_report=cleanup_report,
         pids_found=pids_found,
-        has_gps=has_gps,
-        latitude_start=lat_start,
-        longitude_start=lon_start,
+        is_hybrid=is_hybrid,
     )
 
 
 def load_all_records(directory_path: str = "Records") -> List[ScanTrip]:
-    """Scan and parse all Car Scanner ELM OBD2 CSV files in the specified directory."""
+    """Scan and parse all Car Scanner ELM OBD2 CSV files in the directory and subdirectories."""
     trips = []
-    csv_files = sorted(glob.glob(os.path.join(directory_path, "*.csv")))
+    # Search root and all nested subdirectories
+    csv_files = sorted(
+        glob.glob(os.path.join(directory_path, "*.csv"))
+        + glob.glob(os.path.join(directory_path, "**", "*.csv"), recursive=True)
+    )
     for path in csv_files:
         trip = parse_obd_csv(path)
         if trip is not None:

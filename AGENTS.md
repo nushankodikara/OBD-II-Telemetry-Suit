@@ -1,4 +1,4 @@
-# Agent Instructions & Operating Rules - Car Record Analyzer
+# Agent Instructions Agent Instructions & Operating Rules - Car Record Analyzer Operating Rules - OBD-II Telemetry Suit
 
 This file provides mandatory guidelines and constraints for any AI agent modifying or extending the Car Record Analyzer codebase.
 
@@ -27,9 +27,15 @@ This file provides mandatory guidelines and constraints for any AI agent modifyi
    - The virtual environment is configured with Python 3.14 via Homebrew with `python-tk@3.14`.
 
 4. Architectural Boundaries
-   - Ingestion Layer (`src/data_loader.py`): Handles CSV file I/O, format validation, physical sensor cleaning, GPS jump sanitization, and time synchronization. Keep this layer UI-agnostic.
-   - Analytics Layer (`src/analyzer.py`): Contains automotive physics, metric calculations, anomaly detection (rules and Isolation Forest), and diagnostic health logic. Keep this layer pure Python/NumPy/SciPy/scikit-learn with zero UI dependencies.
-   - Presentation Layer (`src/ui/`): Contains CustomTkinter components, Matplotlib canvases, and `tkintermapview`. It should only call methods on `VehicleAnalyzer` and `ScanTrip` and never perform raw CSV file parsing or recalculate core physics algorithms directly.
+   - Ingestion Layer (`src/data_loader.py`): Handles CSV file I/O, format validation, physical sensor cleaning, and time synchronization. Keep this layer UI-agnostic.
+   - Analytics Layer (`src/analyzer.py`): Contains automotive physics, metric calculations, hybrid diagnostics, anomaly detection (rules and Isolation Forest), and diagnostic health logic. Keep this layer pure Python/NumPy/SciPy/scikit-learn with zero UI dependencies.
+   - Session & Persistence Layer (`src/session_manager.py`): Handles XML serialization/deserialization for vehicle profiles and session state.
+   - Versioning & Release Layer (`src/version.py`, `simpleversion.json`): Manages semver tracking and GitHub update checking.
+   - Presentation Layer (`src/ui/`): Contains CustomTkinter components, Matplotlib canvases, and native menu bar. It should only call methods on `VehicleAnalyzer`, `ScanTrip`, and session functions, and never perform raw CSV file parsing directly.
+
+5. CHANGELOG & Version Tracking Directive
+   - Every time code modifications, new features, enhancements, or bug fixes are introduced, the agent MUST update `CHANGELOG.md` with an entry documenting the changes under the appropriate version header adhering to the zero emoji directive.
+   - Ensure `simpleversion.json` reflects the current version (strictly adhering to the `0.x.x` beta pattern).
 
 ---
 
@@ -93,7 +99,7 @@ Before reporting completion on any code modification, agents MUST:
        if '.git' in root or '.venv' in root:
            continue
        for f in files:
-           if f.endswith(('.py', '.md', '.txt', '.json')):
+           if f.endswith(('.py', '.md', '.txt', '.json', '.yml')):
                p = os.path.join(root, f)
                with open(p, 'r', encoding='utf-8', errors='ignore') as fp:
                    txt = fp.read()

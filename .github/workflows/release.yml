@@ -1,0 +1,181 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run Automated Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests
+
+      - name: Verify zero emoji directive
+        run: |
+          python -c "
+          import os
+          for root, _, files in os.walk('.'):
+              if '.git' in root or '.venv' in root:
+                  continue
+              for f in files:
+                  if f.endswith(('.py', '.md', '.txt', '.json', '.yml', '.yaml')):
+                      p = os.path.join(root, f)
+                      with open(p, 'r', encoding='utf-8', errors='ignore') as fp:
+                          txt = fp.read()
+                          for ch in txt:
+                              if ord(ch) > 127000:
+                                  raise ValueError(f'Emoji detected in {p}: {ch}')
+          print('Zero emoji rule verified across all repository files.')
+          "
+
+  build:
+    name: Build Binary for ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macOS
+            os: macos-latest
+            archive_name: OBD-II-Telemetry-Suit-macOS.zip
+            separator: ":"
+          - target: Linux
+            os: ubuntu-latest
+            archive_name: OBD-II-Telemetry-Suit-Linux.tar.gz
+            separator: ":"
+          - target: Windows
+            os: windows-latest
+            archive_name: OBD-II-Telemetry-Suit-Windows.zip
+            separator: ";"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies (Linux / macOS)
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache pip dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+
+      - name: Build macOS Binary Bundle
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --onedir --windowed \
+            --name "OBD-II-Telemetry-Suit" \
+            --add-data "simpleversion.json${{ matrix.separator }}." \
+            main.py
+          cd dist
+          zip -r "../${{ matrix.archive_name }}" OBD-II-Telemetry-Suit.app || zip -r "../${{ matrix.archive_name }}" OBD-II-Telemetry-Suit
+
+      - name: Build Linux Standalone Binary
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --onefile \
+            --name "OBD-II-Telemetry-Suit" \
+            --add-data "simpleversion.json${{ matrix.separator }}." \
+            main.py
+          cd dist
+          tar -czvf "../${{ matrix.archive_name }}" OBD-II-Telemetry-Suit
+
+      - name: Build Windows Standalone Executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "OBD-II-Telemetry-Suit" `
+            --add-data "simpleversion.json${{ matrix.separator }}." `
+            main.py
+          Compress-Archive -Path dist/OBD-II-Telemetry-Suit.exe -DestinationPath "${{ matrix.archive_name }}"
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-package
+          path: ${{ matrix.archive_name }}
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download all built packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Read version from simpleversion.json
+        id: get_version
+        run: |
+          VER=$(python3 -c "import json; print(json.load(open('simpleversion.json'))['version'])")
+          echo "VERSION=$VER" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OBD-II Telemetry Suit v${{ steps.get_version.outputs.VERSION }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: true
+          files: release-assets/*
+          generate_release_notes: true

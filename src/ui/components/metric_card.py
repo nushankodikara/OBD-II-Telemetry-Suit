@@ -128,9 +128,12 @@ class MetricCard(ctk.CTkFrame):
         subtitle: Optional[str] = None,
         status_text: Optional[str] = None,
         accent_color: Optional[str] = None,
+        title: Optional[str] = None,
     ):
         """Update displayed telemetry and status."""
         self.value_label.configure(text=value)
+        if title is not None:
+            self.title_label.configure(text=title.upper())
         if accent_color:
             self.accent_color = accent_color
             self.value_label.configure(text_color=accent_color)

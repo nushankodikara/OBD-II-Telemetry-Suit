@@ -1,8 +1,9 @@
-"""Automotive data science analyzer for Car Scanner ELM OBD2 scan records.
+"""Automotive data science analyzer for OBD-II Telemetry Suit.
 
 Calculates city, highway, and combined fuel economy, optimal RPM-speed curves,
 fuel efficiency heatmaps, thermal profiles, deep STFT/LTFT diagnostics with
-mechanic repair recommendations, and physical/ML telemetry anomaly detection.
+mechanic repair recommendations, hybrid battery & powertrain diagnostics,
+general user auto-detection, and physical/ML telemetry anomaly detection.
 Strictly adheres to project rules: no emojis.
 """
 
@@ -77,8 +78,6 @@ class TelemetryAnomaly:
     expected_range: str
     description: str
     trip_file: str
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 
 @dataclass
@@ -102,6 +101,43 @@ class FuelTrimDiagnostic:
     likelihood_score: str = "LOW"
     probable_causes: List[str] = field(default_factory=list)
     mechanic_recommendations: List[str] = field(default_factory=list)
+
+
+@dataclass
+class HybridBatteryReport:
+    """Diagnostic health assessment for hybrid vehicle high-voltage powertrain."""
+    is_hybrid: bool
+    soc_mean: Optional[float] = None
+    soc_min: Optional[float] = None
+    soc_max: Optional[float] = None
+    delta_soc: Optional[float] = None
+    current_a_mean: Optional[float] = None
+    max_charge_a: Optional[float] = None
+    max_discharge_a: Optional[float] = None
+    block_voltages: Dict[str, float] = field(default_factory=dict)
+    max_block_v: Optional[float] = None
+    min_block_v: Optional[float] = None
+    delta_block_v: Optional[float] = None
+    battery_health_status: str = "NOT HYBRID"
+    battery_temp_c: Optional[float] = None
+    inverter_temp_c: Optional[float] = None
+    mg1_temp_c: Optional[float] = None
+    mg2_temp_c: Optional[float] = None
+    ev_driving_pct: float = 0.0
+    observations: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AutoDetectedVehicleInfo:
+    """Plain-English vehicle diagnostic summary aimed at general users with minimal knowledge."""
+    vehicle_class: str
+    engine_health_grade: str
+    battery_health_summary: str
+    thermal_condition_summary: str
+    fuel_efficiency_grade: str
+    fuel_trim_summary: str
+    total_sensors_communicated: int
+    plain_english_takeaways: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -231,9 +267,9 @@ class VehicleAnalyzer:
         dfs = []
         for trip in trips:
             df = trip.data
-            if df.empty or "speed_kmh" not in df.columns or "engine_rpm" not in df.columns:
+            if df.empty or "speed_kmh" not in df.columns:
                 continue
-            moving = df[(df["speed_kmh"] > self.min_moving_speed) & (df["engine_rpm"] > 500)].copy()
+            moving = df[df["speed_kmh"] > self.min_moving_speed].copy()
             if not moving.empty:
                 moving["trip_file"] = trip.file_name
                 dfs.append(moving)
@@ -243,11 +279,11 @@ class VehicleAnalyzer:
         return pd.concat(dfs, ignore_index=True)
 
     def compute_optimal_rpm_speed_curve(
-        self, trips: List[ScanTrip], speed_step: float = 5.0
+        self, trips: List[ScanTrip], speed_step: float = 5.0, max_gears: Optional[int] = None
     ) -> Dict[str, Any]:
         """Compute optimal RPM vs Speed relationship and gear ratio traces."""
         combined = self.extract_moving_dataset(trips)
-        if combined.empty:
+        if combined.empty or "engine_rpm" not in combined.columns:
             return {
                 "speed": np.array([]),
                 "rpm": np.array([]),
@@ -259,7 +295,7 @@ class VehicleAnalyzer:
         speed = combined["speed_kmh"].values
         rpm = combined["engine_rpm"].values
 
-        valid_idx = (rpm > 600) & (speed > 5.0)
+        valid_idx = (rpm > 500) & (speed > 5.0)
         s_val = speed[valid_idx]
         r_val = rpm[valid_idx]
 
@@ -295,10 +331,21 @@ class VehicleAnalyzer:
         for i in range(1, len(counts) - 1):
             if counts[i] > counts[i - 1] and counts[i] > counts[i + 1] and counts[i] > 10:
                 peak_ratio = 0.5 * (bin_edges[i] + bin_edges[i + 1])
-                peaks.append(peak_ratio)
+                peaks.append((int(counts[i]), float(peak_ratio)))
+
+        # Limit to configured gear count (e.g. 4 gears for 4-Speed Auto)
+        if max_gears is not None:
+            if max_gears <= 0:
+                selected_ratios = []
+            else:
+                top_peaks = sorted(peaks, key=lambda x: x[0], reverse=True)[:max_gears]
+                selected_ratios = sorted([r for _, r in top_peaks])
+        else:
+            top_peaks = sorted(peaks, key=lambda x: x[0], reverse=True)[:5]
+            selected_ratios = sorted([r for _, r in top_peaks])
 
         gear_lines = []
-        for idx, ratio in enumerate(sorted(peaks)):
+        for idx, ratio in enumerate(selected_ratios):
             gear_lines.append({
                 "gear_name": f"Gear Ratio {idx + 1}",
                 "ratio": float(ratio),
@@ -333,7 +380,7 @@ class VehicleAnalyzer:
             "scatter_fe": np.array([]),
         }
 
-        if combined.empty:
+        if combined.empty or "engine_rpm" not in combined.columns:
             return empty_res
 
         if "fuel_economy_kml" in combined.columns:
@@ -348,7 +395,7 @@ class VehicleAnalyzer:
         rpm = combined["engine_rpm"].values
         fe_val = fe.values
 
-        valid = (speed > 5.0) & (rpm > 600) & (fe_val > 1.0) & (fe_val < 60.0)
+        valid = (speed > 5.0) & (rpm > 500) & (fe_val > 1.0) & (fe_val < 60.0)
         s = speed[valid]
         r = rpm[valid]
         f = fe_val[valid]
@@ -356,8 +403,8 @@ class VehicleAnalyzer:
         if len(s) < 30:
             return empty_res
 
-        s_min, s_max = 10.0, float(min(120.0, np.max(s) + 5.0))
-        r_min, r_max = 700.0, float(min(4000.0, np.max(r) + 100.0))
+        s_min, s_max = 10.0, float(min(125.0, np.max(s) + 5.0))
+        r_min, r_max = 700.0, float(min(4500.0, np.max(r) + 100.0))
 
         s_bins = np.arange(s_min, s_max + speed_step, speed_step)
         r_bins = np.arange(r_min, r_max + rpm_step, rpm_step)
@@ -478,11 +525,207 @@ class VehicleAnalyzer:
             },
         }
 
-    def analyze_fuel_trims_in_depth(self, trips: List[ScanTrip]) -> FuelTrimDiagnostic:
-        """Analyze Short Term and Long Term Fuel Trims across engine operating zones.
+    def analyze_hybrid_powertrain(self, trips: List[ScanTrip]) -> HybridBatteryReport:
+        """Analyze hybrid battery state of charge, block voltage balance, and electric drive."""
+        has_hybrid = any(t.is_hybrid for t in trips)
+        if not has_hybrid:
+            return HybridBatteryReport(is_hybrid=False, battery_health_status="NOT HYBRID")
 
-        Generates mechanic diagnostic hypotheses and concrete repair recommendations.
-        """
+        soc_vals = []
+        current_vals = []
+        block_voltages: Dict[str, List[float]] = {}
+        battery_temps = []
+        inverter_temps = []
+        mg1_temps = []
+        mg2_temps = []
+        total_moving_time = 0.0
+        ev_moving_time = 0.0
+
+        for trip in trips:
+            df = trip.data
+            if df.empty:
+                continue
+
+            # State of Charge
+            if "hv_soc_pct" in df.columns:
+                s = df["hv_soc_pct"].dropna()
+                if not s.empty:
+                    soc_vals.extend(s.values)
+
+            # Battery Pack Current
+            if "hv_current_a" in df.columns:
+                c = df["hv_current_a"].dropna()
+                if not c.empty:
+                    current_vals.extend(c.values)
+
+            # Extract individual Block Voltages V01 - V14
+            for i in range(1, 15):
+                col = f"hv_block_v{i:02d}"
+                if col in df.columns:
+                    b_vals = df[col].dropna()
+                    # Filter valid automotive block voltages (10V to 20V)
+                    valid_b = b_vals[(b_vals >= 10.0) & (b_vals <= 22.0)]
+                    if not valid_b.empty:
+                        b_key = f"Block {i:02d}"
+                        if b_key not in block_voltages:
+                            block_voltages[b_key] = []
+                        block_voltages[b_key].extend(valid_b.values)
+
+            # Thermal sensors
+            if "hv_batt_temp_c" in df.columns:
+                battery_temps.extend(df["hv_batt_temp_c"].dropna().values)
+            if "inverter_temp_c" in df.columns:
+                inverter_temps.extend(df["inverter_temp_c"].dropna().values)
+            if "inverter_mg1_temp_c" in df.columns:
+                mg1_temps.extend(df["inverter_mg1_temp_c"].dropna().values)
+            if "inverter_mg2_temp_c" in df.columns:
+                mg2_temps.extend(df["inverter_mg2_temp_c"].dropna().values)
+
+            # Calculate EV Driving Mode percentage
+            if "speed_kmh" in df.columns:
+                moving = df[df["speed_kmh"] > 1.0]
+                total_moving_time += len(moving)
+                # EV mode: moving with engine off (RPM == 0 or fuel_rate == 0)
+                if "engine_rpm" in moving.columns:
+                    ev_pts = moving[(moving["engine_rpm"] < 300) | (moving.get("fuel_rate_lh", 0.0) <= 0.05)]
+                    ev_moving_time += len(ev_pts)
+
+        # Average block voltages
+        mean_blocks: Dict[str, float] = {}
+        for b_name, vals in sorted(block_voltages.items()):
+            if vals:
+                mean_blocks[b_name] = float(np.mean(vals))
+
+        max_bv = max(mean_blocks.values()) if mean_blocks else None
+        min_bv = min(mean_blocks.values()) if mean_blocks else None
+        delta_bv = (max_bv - min_bv) if (max_bv is not None and min_bv is not None) else None
+
+        # Determine battery cell balance status
+        observations = []
+        if delta_bv is not None:
+            if delta_bv < 0.20:
+                health_status = "[OPTIMAL] Strong Balance"
+                observations.append(f"Hybrid battery block voltage delta is {delta_bv * 1000:.0f} mV (nominal is < 200 mV).")
+            elif delta_bv < 0.40:
+                health_status = "[WARNING] Mild Imbalance"
+                observations.append(f"Hybrid battery block delta is elevated at {delta_bv * 1000:.0f} mV. Cell reconditioning advised.")
+            else:
+                health_status = "[CRITICAL] Severe Degradation"
+                observations.append(f"Critical cell block voltage delta ({delta_bv:.2f} V). Risk of hybrid system shutdown / DTC P0A80.")
+        else:
+            health_status = "[STANDBY] No Block Voltages"
+
+        soc_mean = float(np.mean(soc_vals)) if soc_vals else None
+        soc_min = float(np.min(soc_vals)) if soc_vals else None
+        soc_max = float(np.max(soc_vals)) if soc_vals else None
+        delta_soc = (soc_max - soc_min) if (soc_max is not None and soc_min is not None) else None
+
+        ev_pct = (ev_moving_time / total_moving_time * 100.0) if total_moving_time > 0 else 0.0
+        if ev_pct > 0:
+            observations.append(f"EV Electric Driving Ratio: {ev_pct:.1f}% of total driving distance executed with engine off.")
+
+        return HybridBatteryReport(
+            is_hybrid=True,
+            soc_mean=soc_mean,
+            soc_min=soc_min,
+            soc_max=soc_max,
+            delta_soc=delta_soc,
+            current_a_mean=float(np.mean(current_vals)) if current_vals else None,
+            max_charge_a=float(np.min(current_vals)) if current_vals else None,
+            max_discharge_a=float(np.max(current_vals)) if current_vals else None,
+            block_voltages=mean_blocks,
+            max_block_v=max_bv,
+            min_block_v=min_bv,
+            delta_block_v=delta_bv,
+            battery_health_status=health_status,
+            battery_temp_c=float(np.mean(battery_temps)) if battery_temps else None,
+            inverter_temp_c=float(np.mean(inverter_temps)) if inverter_temps else None,
+            mg1_temp_c=float(np.mean(mg1_temps)) if mg1_temps else None,
+            mg2_temp_c=float(np.mean(mg2_temps)) if mg2_temps else None,
+            ev_driving_pct=ev_pct,
+            observations=observations,
+        )
+
+    def auto_detect_vehicle_info(self, trips: List[ScanTrip]) -> AutoDetectedVehicleInfo:
+        """Automatically infer vehicle class and health for general users without requiring inputs."""
+        if not trips:
+            return AutoDetectedVehicleInfo(
+                vehicle_class="No Data",
+                engine_health_grade="N/A",
+                battery_health_summary="No Scan Data",
+                thermal_condition_summary="N/A",
+                fuel_efficiency_grade="N/A",
+                fuel_trim_summary="N/A",
+                total_sensors_communicated=0,
+                plain_english_takeaways=["Load one or more scan records to generate vehicle intelligence."],
+            )
+
+        # Detect vehicle type
+        is_hybrid = any(t.is_hybrid for t in trips)
+        vehicle_class = "Hybrid Electric Vehicle (HEV)" if is_hybrid else "Conventional Fuel Vehicle (ICE)"
+
+        # Sensors count
+        all_pids = set()
+        for t in trips:
+            all_pids.update(t.pids_found)
+
+        # Battery 12V
+        diag = self.generate_diagnostic_health(trips)
+        b_summary = f"{diag.battery_status} (Avg {diag.battery_mean_v:.1f}V)"
+
+        # Thermal
+        thermal = self.analyze_coolant_temperature(trips)
+        if thermal["has_data"]:
+            t_summary = f"Peak {thermal['max_temp']:.0f} C (Normal thermostat range is 82-95 C)"
+        else:
+            t_summary = "Temperature sensor not recorded"
+
+        # Fuel economy
+        fe = self.calculate_fuel_economy(trips)
+        comb_str = fe.format_value("combined", "km/L")
+        if comb_str != "-":
+            c_val = float(comb_str)
+            if c_val >= 18.0:
+                fe_grade = f"{comb_str} km/L (Excellent Efficiency)"
+            elif c_val >= 13.0:
+                fe_grade = f"{comb_str} km/L (Good Efficiency)"
+            else:
+                fe_grade = f"{comb_str} km/L (Moderate Efficiency)"
+        else:
+            fe_grade = "Insufficient driving data"
+
+        # Hybrid specific
+        hybrid_rep = self.analyze_hybrid_powertrain(trips)
+
+        # Plain English takeaways
+        takeaways = []
+        if is_hybrid:
+            takeaways.append(f"Powertrain: Verified Hybrid Electric Vehicle with {len(hybrid_rep.block_voltages)} monitored battery blocks.")
+            if hybrid_rep.delta_block_v is not None:
+                takeaways.append(f"Hybrid Battery Condition: {hybrid_rep.battery_health_status} with {hybrid_rep.delta_block_v * 1000:.0f} mV cell variance.")
+            if hybrid_rep.ev_driving_pct > 0:
+                takeaways.append(f"Electric Driving: Vehicle drove {hybrid_rep.ev_driving_pct:.0f}% of the trip purely on electric power.")
+        else:
+            takeaways.append("Powertrain: Standard Internal Combustion Engine (ICE).")
+
+        takeaways.append(f"12V Auxiliary System: Alternator and battery registered at {diag.battery_mean_v:.1f}V.")
+        if thermal["has_data"] and thermal["max_temp"] <= 98:
+            takeaways.append(f"Engine Cooling: Engine reached healthy operating temperature ({thermal['max_temp']:.0f} C) with no overheating.")
+        takeaways.append(f"Overall Fuel Economy: Averaged {fe.format_value('combined', 'km/L')} km/L across {fe.total_distance_km:.1f} km.")
+
+        return AutoDetectedVehicleInfo(
+            vehicle_class=vehicle_class,
+            engine_health_grade="Good" if diag.coolant_status != "OVERHEATING" else "Attention Required",
+            battery_health_summary=b_summary,
+            thermal_condition_summary=t_summary,
+            fuel_efficiency_grade=fe_grade,
+            fuel_trim_summary=diag.fuel_trim_status,
+            total_sensors_communicated=len(all_pids),
+            plain_english_takeaways=takeaways,
+        )
+
+    def analyze_fuel_trims_in_depth(self, trips: List[ScanTrip]) -> FuelTrimDiagnostic:
+        """Analyze Short Term and Long Term Fuel Trims across engine operating zones."""
         stft_all, ltft_all = [], []
         idle_stft, idle_ltft = [], []
         cruise_stft, cruise_ltft = [], []
@@ -500,28 +743,20 @@ class VehicleAnalyzer:
             stft_all.extend(valid["stft_pct"].values)
             ltft_all.extend(valid["ltft_pct"].values)
 
-            # Operating zone masks
-            has_speed = "speed_kmh" in valid.columns
-            has_rpm = "engine_rpm" in valid.columns
-            has_load = "engine_load_pct" in valid.columns
+            speed = valid["speed_kmh"] if "speed_kmh" in valid.columns else pd.Series(0.0, index=valid.index)
+            rpm = valid["engine_rpm"] if "engine_rpm" in valid.columns else pd.Series(1000.0, index=valid.index)
+            load = valid["engine_load_pct"] if "engine_load_pct" in valid.columns else pd.Series(30.0, index=valid.index)
 
-            speed = valid["speed_kmh"] if has_speed else pd.Series(0.0, index=valid.index)
-            rpm = valid["engine_rpm"] if has_rpm else pd.Series(1000.0, index=valid.index)
-            load = valid["engine_load_pct"] if has_load else pd.Series(30.0, index=valid.index)
-
-            # Zone 1: Idle (RPM < 1000, Speed < 5 km/h)
             idle_mask = (rpm < 1050) & (speed <= 3.0)
             if np.any(idle_mask):
                 idle_stft.extend(valid.loc[idle_mask, "stft_pct"].values)
                 idle_ltft.extend(valid.loc[idle_mask, "ltft_pct"].values)
 
-            # Zone 2: Cruising (RPM 1200 - 2500, Speed > 25 km/h, Load 15 - 55%)
             cruise_mask = (rpm >= 1200) & (rpm <= 2600) & (speed > 20.0) & (load <= 60.0)
             if np.any(cruise_mask):
                 cruise_stft.extend(valid.loc[cruise_mask, "stft_pct"].values)
                 cruise_ltft.extend(valid.loc[cruise_mask, "ltft_pct"].values)
 
-            # Zone 3: High Load / WOT (Load > 60% or Throttle > 50%)
             high_mask = load > 60.0
             if np.any(high_mask):
                 high_stft.extend(valid.loc[high_mask, "stft_pct"].values)
@@ -553,11 +788,9 @@ class VehicleAnalyzer:
         m_hi_ltft = float(np.mean(high_ltft)) if high_ltft else None
         m_hi_tot = (m_hi_stft + m_hi_ltft) if (m_hi_stft is not None and m_hi_ltft is not None) else None
 
-        # Diagnosis logic based on zone differential
         probable_causes = []
         recommendations = []
 
-        # Case A: Vacuum Leak (high positive trim at idle, drops at cruise)
         if m_idle_tot is not None and m_idle_tot > 10.0 and (m_cr_tot is None or m_idle_tot - m_cr_tot >= 5.0):
             diagnosis_title = "INTAKE VACUUM LEAK SUSPECTED"
             severity = "CRITICAL"
@@ -566,16 +799,12 @@ class VehicleAnalyzer:
                 "Unmetered air entering post-MAF (intake manifold gasket, vacuum line rupture).",
                 "Faulty Positive Crankcase Ventilation (PCV) valve or cracked hose.",
                 "Leaking brake booster check valve or diaphragm.",
-                "EGR valve stuck slightly unseated.",
             ]
             recommendations = [
                 "Step 1: Perform an automotive smoke test on the intake plenum and vacuum lines.",
                 "Step 2: Inspect PCV valve for sticking and check PCV rubber elbow for softening or cracks.",
                 "Step 3: Clamp the brake booster vacuum hose while monitoring live STFT; if trim normalizes, replace booster.",
-                "Step 4: Check intake manifold runner flap actuators and throttle body mounting gasket.",
             ]
-
-        # Case B: Fuel Delivery Starvation / Weak Fuel Pump / Clogged Filter / MAF
         elif (m_cr_tot is not None and m_cr_tot > 10.0) or (m_hi_tot is not None and m_hi_tot > 12.0) or mean_tot > 10.0:
             diagnosis_title = "FUEL STARVATION / LOW SYSTEM DELIVERY"
             severity = "CRITICAL"
@@ -584,16 +813,12 @@ class VehicleAnalyzer:
                 "Weak in-tank fuel pump failing to maintain pressure under demand.",
                 "Restricted inline fuel filter or dirty fuel pump strainer sock.",
                 "Contaminated Mass Air Flow (MAF) sensor under-reporting air mass.",
-                "Clogged or gummed fuel injector nozzles on Bank 1.",
             ]
             recommendations = [
                 "Step 1: Connect mechanical fuel pressure gauge to fuel rail; measure static and load pressure.",
-                "Step 2: Clean MAF sensor heated sensing wire using specialized MAF cleaner aerosol.",
+                "Step 2: Clean MAF sensor heated sensing wire using specialized MAF aerosol.",
                 "Step 3: Replace inline fuel filter if past service interval (> 40,000 km).",
-                "Step 4: Execute fuel injector balance and flow volume test.",
             ]
-
-        # Case C: Rich Running / Fuel Over-Delivery
         elif mean_tot < -10.0 or (m_idle_tot is not None and m_idle_tot < -10.0):
             diagnosis_title = "SYSTEM RUNNING RICH (OVER-FUELING)"
             severity = "WARNING"
@@ -602,16 +827,12 @@ class VehicleAnalyzer:
                 "Stuck-open or leaking fuel injector dripping uncommanded fuel into cylinder.",
                 "Faulty fuel pressure regulator (diaphragm ruptured or high return restriction).",
                 "EVAP canister purge solenoid stuck open drawing fuel vapor continuously.",
-                "Severely restricted engine air filter or obstructed air intake duct.",
             ]
             recommendations = [
-                "Step 1: Inspect spark plugs for wet black carbon fouling indicating cylinder-specific rich fault.",
+                "Step 1: Inspect spark plugs for wet black carbon fouling.",
                 "Step 2: Disconnect EVAP purge line and cap intake port; observe if STFT climbs back to zero.",
                 "Step 3: Check fuel rail pressure regulator vacuum reference hose for presence of liquid fuel.",
-                "Step 4: Inspect engine air filter and air box intake snorkel for obstructions.",
             ]
-
-        # Case D: Marginal Trim
         elif abs(mean_tot) > 7.0:
             diagnosis_title = "MARGINAL CLOSED-LOOP TRIM"
             severity = "WARNING"
@@ -624,8 +845,6 @@ class VehicleAnalyzer:
                 "Step 1: Clean throttle body bore and perform electronic throttle relearn.",
                 "Step 2: Monitor upstream O2 sensor switching frequency on oscilloscope or live scanner graph.",
             ]
-
-        # Case E: Healthy / Normal Regulation
         else:
             diagnosis_title = "OPTIMAL CLOSED-LOOP REGULATION"
             severity = "OPTIMAL"
@@ -666,7 +885,6 @@ class VehicleAnalyzer:
             if df.empty:
                 continue
 
-            # Extract fields
             speed = df["speed_kmh"] if "speed_kmh" in df.columns else pd.Series(0.0, index=df.index)
             rpm = df["engine_rpm"] if "engine_rpm" in df.columns else pd.Series(0.0, index=df.index)
             volt = df["voltage_v"] if "voltage_v" in df.columns else pd.Series(np.nan, index=df.index)
@@ -674,13 +892,11 @@ class VehicleAnalyzer:
             stft = df["stft_pct"] if "stft_pct" in df.columns else pd.Series(0.0, index=df.index)
             ltft = df["ltft_pct"] if "ltft_pct" in df.columns else pd.Series(0.0, index=df.index)
             fuel_rate = df["fuel_rate_lh"] if "fuel_rate_lh" in df.columns else pd.Series(0.0, index=df.index)
-            has_lat = "latitude" in df.columns
-            has_lon = "longitude" in df.columns
 
-            # Rule 1: Alternator Undercharging / Battery Dropout (< 12.2V while running)
+            # Rule 1: Alternator Undercharging (< 12.2V while running)
             running_mask = (rpm > 650) & volt.notna() & (volt < 12.2)
             if np.any(running_mask):
-                for idx in df[running_mask].index[:3]:  # Capture sample occurrences
+                for idx in df[running_mask].index[:3]:
                     t_sec = float(idx)
                     v_val = float(volt.loc[idx])
                     anomalies.append(TelemetryAnomaly(
@@ -688,16 +904,14 @@ class VehicleAnalyzer:
                         timestamp_min=t_sec / 60.0,
                         category="[ELECTRICAL]",
                         severity="[CRITICAL]",
-                        metric_name="OBD Module Voltage",
+                        metric_name="12V System Voltage",
                         detected_value=f"{v_val:.1f} V",
                         expected_range="13.5 - 14.8 V",
-                        description="Battery voltage dropped below 12.2V while engine running. Alternator undercharging or excessive parasitic draw.",
+                        description="Battery voltage dropped below 12.2V while engine running. Alternator undercharging or battery failing.",
                         trip_file=trip.file_name,
-                        latitude=float(df.loc[idx, "latitude"]) if (has_lat and pd.notna(df.loc[idx, "latitude"])) else None,
-                        longitude=float(df.loc[idx, "longitude"]) if (has_lon and pd.notna(df.loc[idx, "longitude"])) else None,
                     ))
 
-            # Rule 2: Alternator Overvoltage Spike (> 15.2V)
+            # Rule 2: Voltage Spike (> 15.2V)
             overvolt_mask = volt.notna() & (volt > 15.2)
             if np.any(overvolt_mask):
                 for idx in df[overvolt_mask].index[:2]:
@@ -708,16 +922,14 @@ class VehicleAnalyzer:
                         timestamp_min=t_sec / 60.0,
                         category="[ELECTRICAL]",
                         severity="[CRITICAL]",
-                        metric_name="OBD Module Voltage",
+                        metric_name="12V System Voltage",
                         detected_value=f"{v_val:.1f} V",
                         expected_range="13.5 - 14.8 V",
                         description="Voltage regulator spike above 15.2V. High risk of electrical ECU/battery damage.",
                         trip_file=trip.file_name,
-                        latitude=float(df.loc[idx, "latitude"]) if (has_lat and pd.notna(df.loc[idx, "latitude"])) else None,
-                        longitude=float(df.loc[idx, "longitude"]) if (has_lon and pd.notna(df.loc[idx, "longitude"])) else None,
                     ))
 
-            # Rule 3: Coolant Overheat Warning (> 100 C)
+            # Rule 3: Coolant Overheat (> 100 C)
             overheat_mask = temp.notna() & (temp >= 100.0)
             if np.any(overheat_mask):
                 for idx in df[overheat_mask].index[:3]:
@@ -733,11 +945,9 @@ class VehicleAnalyzer:
                         expected_range="82 - 95 C",
                         description="Coolant exceeded 100 C. Check cooling fan operation, thermostat, and coolant level.",
                         trip_file=trip.file_name,
-                        latitude=float(df.loc[idx, "latitude"]) if (has_lat and pd.notna(df.loc[idx, "latitude"])) else None,
-                        longitude=float(df.loc[idx, "longitude"]) if (has_lon and pd.notna(df.loc[idx, "longitude"])) else None,
                     ))
 
-            # Rule 4: Extreme Fuel Trim Spike (> +18% lean surge or < -18% rich surge)
+            # Rule 4: Extreme Fuel Trim Spike (> +18% or < -18%)
             total_trim = stft + ltft
             trim_lean_mask = total_trim > 18.0
             if np.any(trim_lean_mask):
@@ -752,13 +962,11 @@ class VehicleAnalyzer:
                         metric_name="Total Fuel Trim (STFT+LTFT)",
                         detected_value=f"{trim_val:+.1f}%",
                         expected_range="-7% to +7%",
-                        description="Severe positive fuel trim surge. Fuel delivery deficit or sudden unmetered intake vacuum leak.",
+                        description="Severe positive fuel trim surge. Fuel delivery deficit or sudden intake vacuum leak.",
                         trip_file=trip.file_name,
-                        latitude=float(df.loc[idx, "latitude"]) if (has_lat and pd.notna(df.loc[idx, "latitude"])) else None,
-                        longitude=float(df.loc[idx, "longitude"]) if (has_lon and pd.notna(df.loc[idx, "longitude"])) else None,
                     ))
 
-            # Rule 5: Speed Sensor Dropout (RPM > 1800, Load > 30%, but Speed == 0)
+            # Rule 5: Speed Sensor Dropout (RPM > 1800, Load > 30%, Speed == 0)
             dropout_mask = (rpm > 1800) & (fuel_rate > 3.0) & (speed == 0.0)
             if np.any(dropout_mask):
                 for idx in df[dropout_mask].index[:2]:
@@ -771,10 +979,8 @@ class VehicleAnalyzer:
                         metric_name="Speed / RPM Coherence",
                         detected_value="0.0 km/h @ high RPM",
                         expected_range="> 15 km/h",
-                        description="Vehicle speed sensor (VSS) signal dropped to 0 km/h while engine under load, or severe clutch/transmission slip.",
+                        description="Vehicle speed sensor (VSS) signal dropped to 0 km/h under load, or severe clutch/transmission slip.",
                         trip_file=trip.file_name,
-                        latitude=float(df.loc[idx, "latitude"]) if (has_lat and pd.notna(df.loc[idx, "latitude"])) else None,
-                        longitude=float(df.loc[idx, "longitude"]) if (has_lon and pd.notna(df.loc[idx, "longitude"])) else None,
                     ))
 
             # Rule 6: Machine Learning Multivariate Anomaly Detection (Isolation Forest)
@@ -786,12 +992,10 @@ class VehicleAnalyzer:
             if len(ml_cols) >= 3 and len(df) >= 60:
                 try:
                     feat_data = df[ml_cols].copy().interpolate().bfill().ffill()
-                    # Fit lightweight Isolation Forest
                     iso = IsolationForest(contamination=0.01, random_state=42, n_estimators=50)
                     preds = iso.fit_predict(feat_data)
                     outlier_indices = df.index[preds == -1]
 
-                    # Take up to 2 distinct multivariate anomalies
                     for o_idx in outlier_indices[:2]:
                         t_sec = float(o_idx)
                         anomalies.append(TelemetryAnomaly(
@@ -804,8 +1008,6 @@ class VehicleAnalyzer:
                             expected_range="Nominal Cluster",
                             description="Isolation Forest detected atypical sensor state correlation (unusual speed, load, and fuel rate combination).",
                             trip_file=trip.file_name,
-                            latitude=float(df.loc[o_idx, "latitude"]) if (has_lat and pd.notna(df.loc[o_idx, "latitude"])) else None,
-                            longitude=float(df.loc[o_idx, "longitude"]) if (has_lon and pd.notna(df.loc[o_idx, "longitude"])) else None,
                         ))
                 except Exception:
                     pass

@@ -1,0 +1,8 @@
+{
+  "version": "0.2.0-beta",
+  "name": "OBD-II Telemetry Suit",
+  "status": "beta",
+  "release_date": "2026-10-16",
+  "min_python": "3.10",
+  "github_repo": "nushankodi/OBD-II-Telemetry-Suit"
+}

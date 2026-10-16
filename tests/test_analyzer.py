@@ -1,15 +1,16 @@
-"""Automated test suite for OBD-II vehicle scan analyzer.
+"""Automated test suite for OBD-II Telemetry Suit.
 
-Tests data loader parsing, pre-ingestion cleanup, GPS jump filtering,
-fuel economy metrics, fallback behavior, RPM curves, efficiency maps,
-deep STFT/LTFT diagnostics with repair plans, and anomaly detection.
+Tests data loader parsing, pre-ingestion cleanup, fuel economy metrics,
+fallback behavior, RPM curves, efficiency maps, deep STFT/LTFT diagnostics,
+hybrid battery & powertrain analysis, auto-detection vehicle info,
+and XML session saving and loading.
 Strictly adheres to project rules: no emojis.
 """
 
 import os
+import tempfile
 import unittest
 import numpy as np
-import pandas as pd
 
 from src.data_loader import parse_obd_csv, load_all_records, clean_raw_obd_data
 from src.analyzer import (
@@ -17,7 +18,14 @@ from src.analyzer import (
     FuelEconomyResult,
     DiagnosticHealthReport,
     FuelTrimDiagnostic,
+    HybridBatteryReport,
+    AutoDetectedVehicleInfo,
     TelemetryAnomaly,
+)
+from src.session_manager import (
+    VehicleProfile,
+    save_session_to_xml,
+    load_session_from_xml,
 )
 
 
@@ -25,7 +33,7 @@ class TestOBDDataLoader(unittest.TestCase):
     """Test data loader, cleanup engine, and synchronization routines."""
 
     def test_parse_single_csv(self):
-        sample_file = "Records/2026-09-08 09-19-22.csv"
+        sample_file = "Records/exported_records (6)/2026-09-08 09-19-22.csv"
         self.assertTrue(os.path.exists(sample_file), f"File {sample_file} not found.")
 
         trip = parse_obd_csv(sample_file)
@@ -34,28 +42,21 @@ class TestOBDDataLoader(unittest.TestCase):
         self.assertGreater(trip.duration_seconds, 100)
         self.assertIn("speed_kmh", trip.data.columns)
         self.assertIn("engine_rpm", trip.data.columns)
-        self.assertTrue(trip.has_gps)
-        self.assertIn("latitude", trip.data.columns)
-        self.assertIn("longitude", trip.data.columns)
 
     def test_pre_ingestion_cleanup_report(self):
-        sample_file = "Records/2026-09-08 09-19-22.csv"
+        sample_file = "Records/exported_records (6)/2026-09-08 09-19-22.csv"
         trip = parse_obd_csv(sample_file)
         self.assertIsNotNone(trip)
         rep = trip.cleanup_report
 
         self.assertGreater(rep.total_raw_rows, 0)
         self.assertEqual(rep.valid_rows_retained, rep.total_raw_rows)
-        # GPS jumps should have been detected and cleaned
-        self.assertGreater(rep.gps_jumps_filtered, 0)
 
-    def test_load_all_records(self):
-        trips = load_all_records("Records")
+    def test_load_records_directory(self):
+        trips = load_all_records("Records/exported_records (6)")
         self.assertGreaterEqual(len(trips), 8)
         for t in trips:
             self.assertGreater(len(t.data), 0)
-            self.assertTrue(t.has_gps)
-            self.assertGreater(len(t.gps_coordinates), 0)
 
 
 class TestVehicleAnalyzer(unittest.TestCase):
@@ -63,7 +64,7 @@ class TestVehicleAnalyzer(unittest.TestCase):
 
     def setUp(self):
         self.analyzer = VehicleAnalyzer(city_speed_max=45.0, highway_speed_min=70.0)
-        self.trips = load_all_records("Records")
+        self.trips = load_all_records("Records/exported_records (6)")
 
     def test_fuel_economy_calculation(self):
         fe = self.analyzer.calculate_fuel_economy(self.trips)
@@ -77,7 +78,7 @@ class TestVehicleAnalyzer(unittest.TestCase):
         self.assertLess(fe.highway_kml, 40.0)
 
     def test_insufficient_highway_data_fallback(self):
-        trip = parse_obd_csv("Records/2026-09-08 09-19-22.csv")
+        trip = parse_obd_csv("Records/exported_records (6)/2026-09-08 09-19-22.csv")
         fe = self.analyzer.calculate_fuel_economy([trip])
 
         self.assertIsNotNone(fe.city_kml)
@@ -149,6 +150,134 @@ class TestVehicleAnalyzer(unittest.TestCase):
             self.assertIsNotNone(a.metric_name)
             self.assertIsNotNone(a.detected_value)
             self.assertIsNotNone(a.description)
+
+
+class TestHybridAndAutoDetect(unittest.TestCase):
+    """Test hybrid battery analysis and automated vehicle intelligence."""
+
+    def setUp(self):
+        self.analyzer = VehicleAnalyzer()
+        self.hybrid_trips = load_all_records("Records/exported_records (2)")
+
+    def test_hybrid_powertrain_analysis(self):
+        self.assertGreater(len(self.hybrid_trips), 0)
+        rep = self.analyzer.analyze_hybrid_powertrain(self.hybrid_trips)
+
+        self.assertTrue(rep.is_hybrid)
+        self.assertIsNotNone(rep.soc_mean)
+        self.assertGreater(rep.soc_mean, 20.0)
+        self.assertLess(rep.soc_mean, 90.0)
+        self.assertIsNotNone(rep.delta_block_v)
+        self.assertLess(rep.delta_block_v, 1.0)
+        self.assertIn("Block 01", rep.block_voltages)
+        self.assertIn("Block 10", rep.block_voltages)
+        self.assertEqual(len(rep.block_voltages), 10)
+        self.assertIn("[OPTIMAL]", rep.battery_health_status)
+
+    def test_auto_detect_vehicle_info_hybrid(self):
+        info = self.analyzer.auto_detect_vehicle_info(self.hybrid_trips)
+        self.assertIn("Hybrid Electric Vehicle", info.vehicle_class)
+        self.assertGreater(info.total_sensors_communicated, 20)
+        self.assertGreater(len(info.plain_english_takeaways), 2)
+
+    def test_auto_detect_vehicle_info_ice(self):
+        ice_trips = load_all_records("Records/exported_records (6)")
+        info = self.analyzer.auto_detect_vehicle_info(ice_trips)
+        self.assertIn("Conventional Fuel Vehicle (ICE)", info.vehicle_class)
+        self.assertGreater(len(info.plain_english_takeaways), 2)
+
+
+class TestSessionManager(unittest.TestCase):
+    """Test XML session persistence and vehicle profile serialization."""
+
+    def test_save_and_load_xml_session(self):
+        profile = VehicleProfile(
+            make="Toyota",
+            model="Aqua",
+            year="2015",
+            engine_type="Hybrid Petrol",
+            displacement_cc="1500",
+            transmission="e-CVT",
+            gears="1",
+            tyre_size="175/65R15",
+            fuel_tank_l="36",
+            notes="1NZ-FXE Atkinson cycle",
+        )
+        data_paths = [
+            os.path.abspath("Records/exported_records (2)/2026-07-27 11-46-24.csv")
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            saved = save_session_to_xml(
+                file_path=tmp_path,
+                profile=profile,
+                city_threshold=42.0,
+                highway_threshold=68.0,
+                unit="MPG (US)",
+                data_file_paths=data_paths,
+            )
+            self.assertTrue(saved)
+
+            loaded = load_session_from_xml(tmp_path)
+            self.assertIsNotNone(loaded)
+            loaded_prof, loaded_settings, loaded_files = loaded
+
+            self.assertEqual(loaded_prof.make, "Toyota")
+            self.assertEqual(loaded_prof.model, "Aqua")
+            self.assertEqual(loaded_prof.year, "2015")
+            self.assertEqual(loaded_prof.engine_type, "Hybrid Petrol")
+            self.assertEqual(loaded_prof.displacement_cc, "1500")
+            self.assertEqual(loaded_prof.transmission, "e-CVT")
+            self.assertEqual(loaded_prof.tyre_size, "175/65R15")
+            self.assertEqual(loaded_prof.fuel_tank_l, "36")
+            self.assertEqual(loaded_prof.notes, "1NZ-FXE Atkinson cycle")
+
+            self.assertEqual(loaded_settings["city_threshold"], 42.0)
+            self.assertEqual(loaded_settings["highway_threshold"], 68.0)
+            self.assertEqual(loaded_settings["unit"], "MPG (US)")
+
+            self.assertEqual(len(loaded_files), 1)
+            self.assertEqual(loaded_files[0], data_paths[0])
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_vehicle_profile_gears_and_configured(self):
+        p1 = VehicleProfile(gears="4-Speed Auto")
+        self.assertEqual(p1.forward_gears, 4)
+        self.assertFalse(p1.is_configured)
+
+        p2 = VehicleProfile(make="Mazda", model="3", gears="6-Speed Manual")
+        self.assertEqual(p2.forward_gears, 6)
+        self.assertTrue(p2.is_configured)
+
+        p3 = VehicleProfile(gears="e-CVT (Hybrid)")
+        self.assertEqual(p3.forward_gears, 1)
+
+
+class TestGearsAndVersioning(unittest.TestCase):
+    """Test gear constraint logic and version management."""
+
+    def test_optimal_rpm_speed_curve_max_gears_constraint(self):
+        analyzer = VehicleAnalyzer()
+        trips = load_all_records("Records/exported_records (6)")
+        res_4 = analyzer.compute_optimal_rpm_speed_curve(trips, max_gears=4)
+        self.assertLessEqual(len(res_4["gear_lines"]), 4)
+
+        res_5 = analyzer.compute_optimal_rpm_speed_curve(trips, max_gears=5)
+        self.assertLessEqual(len(res_5["gear_lines"]), 5)
+
+    def test_version_helpers(self):
+        from src.version import parse_semver, is_version_newer, get_app_version
+        v = get_app_version()
+        self.assertIsNotNone(v)
+        self.assertTrue(v.startswith("0."))
+        self.assertTrue(is_version_newer("0.3.0", "0.2.0-beta"))
+        self.assertFalse(is_version_newer("0.1.0", "0.2.0-beta"))
+        self.assertFalse(is_version_newer("0.2.0-beta", "0.2.0-beta"))
 
 
 if __name__ == "__main__":

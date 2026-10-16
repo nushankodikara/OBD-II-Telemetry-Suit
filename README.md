@@ -1,10 +1,10 @@
-# Car Record Analyzer - OBD-II Diagnostic Telemetry Suite
+# OBD-II Telemetry Suit
 
-A mechanic-grade desktop workstation for analyzing exported vehicle scan records. Built with Python, CustomTkinter, and Matplotlib, this application ingests CSV trip logs, executes multi-stage data cleanup, synchronizes asynchronous sensor streams, and executes automotive data science workflows to compute city, highway, and combined fuel economy, gear operating envelopes, 2D efficiency heatmaps, thermal stability profiles, in-depth fuel trim recommendations, live GPS route telemetry, and physical/ML anomaly detection.
+A mechanic-grade desktop diagnostic workstation for analyzing exported vehicle scan records. Built with Python, CustomTkinter, and Matplotlib, this application ingests CSV trip logs, executes multi-stage data cleanup, synchronizes asynchronous sensor streams, and executes automotive data science workflows to compute city, highway, and combined fuel economy, gear operating envelopes, 2D efficiency heatmaps, thermal stability profiles, in-depth fuel trim recommendations, hybrid battery cell diagnostics, automated plain-English vehicle intelligence, and physical/ML anomaly detection.
 
-IMPORTANT NOTICE: This tool ingests only Car Scanner ELM OBD2 app's vertical export format (semicolon-delimited with SECONDS, PID, VALUE, UNITS, LATITUDE, LONGTITUDE).
+IMPORTANT NOTICE: This tool exclusively ingests the Car Scanner ELM OBD2 app's vertical export format (semicolon-delimited with SECONDS, PID, VALUE, UNITS, LATITUDE, LONGTITUDE).
 
-Strict Project Requirement: No emojis are used in this codebase or documentation.
+Strict Project Requirement: Zero emojis are used across the entire codebase, UI, tests, and documentation.
 
 ---
 
@@ -13,30 +13,60 @@ Strict Project Requirement: No emojis are used in this codebase or documentation
 1. Car Scanner ELM OBD2 Format & Pre-Ingestion Data Cleanup
    - Exclusively engineered for the vertical export format produced by the Car Scanner ELM OBD2 application.
    - Multi-stage pre-ingestion cleaning pipeline:
-     * Sensor bounds sanitization: eliminates corrupted electrical noise spikes (e.g. RPM > 9,000, Speed > 260 km/h, negative fuel consumption).
-     * GPS teleportation jump filter: detects impossible positional leaps (> 2 km jump or implied velocity > 220 km/h) and reconstructs clean continuous coordinates.
+     * Sensor bounds sanitization: clamps physical sensor ranges (e.g. RPM 0-9,000, Speed 0-260 km/h, Coolant -40 to 140 C).
      * Deduplication: discards redundant sequential PID polling artifacts.
      * Deceleration fuel cut-off (DFCO) conditioning: flags coasting injector shutoff spikes (> 60 km/L) to prevent calculation distortion.
-     * Data quality audit card displaying raw rows count, retained valid records, filtered GPS jumps, and sanitized outliers.
+     * Data quality audit card displaying raw rows count, retained valid records, duplicate queries eliminated, and sanitized outliers.
 
 2. Automotive Fuel Economy Telemetry
    - Instant computation of City, Highway, and Combined fuel economy.
    - Intelligent fallback displaying "-" whenever insufficient driving distance or speed coverage exists for a category (for example, trips without highway speeds).
    - Real-time unit conversions between km/L (native log format), L/100km, MPG (US), and MPG (UK).
-   - Configurable speed thresholds via dedicated dialog (defaults: City <= 45 km/h, Highway >= 70 km/h).
+   - Configurable speed thresholds (defaults: City <= 45 km/h, Highway >= 70 km/h).
    - Weighted moving distance-to-fuel integration that eliminates idle skew and deceleration fuel cut-off anomalies.
 
-3. Live GPS Route Map & Spatial Telemetry Heatmap
-   - Interactive OpenStreetMap (via TkinterMapView) rendering the actual recorded GPS route path.
-   - Dynamic start and finish waypoints with anomaly markers pinned at exact geographical fault locations.
-   - Spatial Telemetry Heatmap mode: renders high-resolution route traces color-coded by selected telemetry:
-     * Fuel Economy (shows where fuel was consumed vs peak efficiency zones)
-     * Vehicle Speed (highlights urban stop-and-go vs open highway)
-     * Engine RPM (shows high rev acceleration corridors)
-     * Engine Coolant Temperature
-     * Total Fuel Trim (STFT + LTFT %)
+3. Dynamic Hybrid Powertrain & Battery Health Workstation
+   - Dynamically active: The dedicated "Hybrid Battery & Powertrain" tab is hidden by default and only appears when analyzing records from a hybrid vehicle (HEV / PHEV).
+   - Computes High Voltage (HV) battery State of Charge (SOC %) range, mean, and swing.
+   - Monitors individual Battery Block Voltages (V01 to V14) and computes the critical Block Voltage Delta ($V_{\Delta} = V_{\text{max}} - V_{\text{min}}$).
+   - Real-time cell health grading:
+     * [OPTIMAL] Strong Balance ($V_{\Delta} < 0.20$ V / 200 mV)
+     * [WARNING] Mild Imbalance ($0.20 \text{ V} \le V_{\Delta} < 0.40$ V)
+     * [CRITICAL] Severe Degradation ($V_{\Delta} \ge 0.40$ V, risk of DTC P0A80)
+   - High-voltage battery pack current (charge/discharge rates in Amperes), battery temperatures, and inverter/MG temperatures.
+   - Pure electric propulsion ratio (EV Driving %) tracking time and distance executed with the internal combustion engine off.
+   - Dynamic top metric card 6: Displays [HYBRID SOC] and block delta for HEVs, or [IDLE TIME %] for standard combustion vehicles.
 
-4. In-Depth Fuel Trim Diagnostics (STFT & LTFT) & Repair Recommendations
+4. Quick Vehicle Info for Everyday Drivers
+   - Automated vehicle intelligence tool designed for non-technical vehicle owners and general users without requiring manual specification inputs.
+   - Automatically identifies powertrain category: Hybrid Electric Vehicle (HEV) vs Conventional Fuel Vehicle (ICE).
+   - Generates plain-English health summaries for the 12V auxiliary battery, cooling system, fuel efficiency rating, and powertrain condition.
+   - Accessible at any time via the top toolbar button or the Vehicle & Settings menu.
+
+5. Vehicle Profile, Settings & XML Session Persistence
+   - Dedicated Vehicle Profile & Settings page and standalone modal dialog:
+     * Automatically opens a standalone configuration window by default when importing records if vehicle profile settings are not yet configured.
+     * Configure Vehicle Make, Model, and Year
+     * Engine Type (Petrol, Diesel, Hybrid Petrol, Turbo Petrol, EV)
+     * Engine Displacement (cc)
+     * Transmission Type and Number of Gears / Ratios (e.g. 4-Speed Auto, 5-Speed Manual, 6-Speed Auto, etc.)
+     * Accurately constrains the RPM vs Speed operating curve to the configured number of forward gears (e.g. 4-speed auto displays only gears 1 through 4).
+     * Tyre Size (e.g. 185/65R15)
+     * Fuel Tank Capacity (L) and Mechanic Notes
+     * City and Highway Speed Thresholds
+   - Clean XML persistence format (`OBDIITelemetrySuitSession` schema): saves vehicle profile, threshold settings, and exact file paths to imported scan records.
+   - Save, Save As, and Open session workflows.
+   - Startup state: starts clean with no data loaded on initial launch, or automatically restores the previous working state if `last_session.xml` is present.
+
+6. Native Application Menu Bar & Software Updates
+   - Full native menu bar replacing default Tkinter options:
+     * File: New Session (Ctrl+N), Open Session XML (Ctrl+O), Save Session XML (Ctrl+S), Save Session As XML, Import Car Scanner CSV, Import Records Folder, Export Comprehensive Diagnostic Report, Exit.
+     * Vehicle & Settings: Vehicle Profile & Settings, Quick Vehicle Info, Speed Thresholds, Fuel Economy Units.
+     * Help: Check for Updates..., ELM OBD2 Format Guide, About OBD-II Telemetry Suit.
+   - In-Software Update Checker: Queries GitHub Releases API in a background thread to check for new binary builds and directs users to download releases.
+   - Versioning & Changelog: Version tracked via `simpleversion.json` (beta `0.x.x` pattern) with detailed revision history in `CHANGELOG.md`.
+
+7. In-Depth Fuel Trim Diagnostics (STFT & LTFT) & Repair Recommendations
    - Diagnostic separation of fuel trim performance into 3 distinct automotive operating regimes:
      * Idle Zone (RPM < 1,000, Speed < 5 km/h, Load < 35%)
      * Cruising Zone (RPM 1,200 - 2,500, Speed > 25 km/h, Load 15 - 55%)
@@ -48,7 +78,7 @@ Strict Project Requirement: No emojis are used in this codebase or documentation
      * Optimal Closed-Loop Stoichiometric Control (+/- 7% ideal band)
    - Step-by-step diagnostic test procedures and likelihood scores designed for automotive technicians.
 
-5. Telemetry Anomaly Detection Center
+8. Telemetry Anomaly Detection Center
    - Hybrid anomaly detection combining deterministic automotive engineering rules and multivariate Machine Learning:
      * Alternator undercharging / voltage drop (< 12.2V with engine running)
      * Voltage regulator spikes (> 15.2V)
@@ -56,26 +86,16 @@ Strict Project Requirement: No emojis are used in this codebase or documentation
      * Fuel trim surge anomalies (> +18% lean spike or < -18% rich spike)
      * Speed sensor dropout / drivetrain slip (0 km/h at high engine load and RPM)
      * Scikit-Learn Isolation Forest identifying subtle multivariate sensor state outliers.
-   - Scrollable anomaly event register with severity badges ([CRITICAL], [WARNING], [INFO]), timestamps, observed values, expected ranges, and GPS coordinates.
+   - Scrollable anomaly event register with severity badges ([CRITICAL], [WARNING], [INFO]), timestamps, observed values, and expected ranges.
 
-6. Optimal RPM and Speed Operating Curve
-   - Visualizes the vehicle speed versus engine RPM operating envelope across all sampled drive points.
-   - Identifies median engine operating RPMs across discrete speed bands.
+9. Optimal RPM Operating Curve & 2D Efficiency Heatmap
+   - Visualizes vehicle speed versus engine RPM operating envelope across all sampled drive points.
    - Detects transmission gear ratio lines (km/h per 1,000 RPM) to highlight shift profiles and cruising gears.
-
-7. 2D Efficiency Heatmap & Cruising Sweet Spot
    - Generates a 2D surface of fuel economy across binned Speed (km/h) and RPM (rpm) coordinates.
-   - Overlays the peak efficiency curve demonstrating the optimal RPM for any road speed.
    - Automatically identifies and highlights the global vehicle "Efficiency Sweet Spot" (speed and RPM yielding maximum cruising economy).
 
-8. Engine Thermal and Cooling Profile
-   - Plots engine coolant temperature over elapsed trip time for individual and combined sessions.
-   - Visualizes the standard automotive thermostat operating band (82 C to 95 C) and triggers alerts if temperatures exceed 100 C.
-   - Analyzes thermal response relative to calculated engine load.
-
-9. Reporting and Data Export
-   - Detailed trip comparison table displaying duration, distance, city/highway/combined fuel economy, peak speed, and peak temperature.
-   - Export feature outputting comprehensive diagnostic reports in plain text or CSV format.
+10. Multi-Vehicle Datasets
+    - Pre-loaded with 8 distinct vehicle datasets inside the `Records/` directory, spanning ICE passenger cars and Toyota Hybrid Synergy Drive (THS-II) vehicles.
 
 ---
 
@@ -120,7 +140,9 @@ To launch the desktop workstation:
 .venv/bin/python main.py
 ```
 
-Upon launch, the application automatically loads sample records located in the `Records/` folder, executes data cleanup, analyzes all sessions, and renders the diagnostic telemetry cards and charts.
+- Initial Startup: Launches in a clean blank state. Use `File -> Import Records Folder` or `File -> Import Car Scanner CSV` to load records from `Records/`.
+- Subsequent Startups: Automatically restores the previous session and vehicle profile if `last_session.xml` exists.
+- Reset: Use `File -> New Session` or `Ctrl+N` to clear the workspace at any time.
 
 ---
 
