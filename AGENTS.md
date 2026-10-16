@@ -15,17 +15,21 @@ This file provides mandatory guidelines and constraints for any AI agent modifyi
      - Test descriptions and assertions
      - Markdown documentation (README, HANDOFF, MEMORY, AGENTS, etc.)
      - Commit messages and diff annotations
-   - If an indicator or status badge is needed, use plain text brackets such as `[NORMAL]`, `[ALERT]`, `[OPTIMAL]`, `[NO DATA]`, `[HWY+CITY]`, `[PASS]`, or `[FAULT]`.
+   - If an indicator or status badge is needed, use plain text brackets such as `[NORMAL]`, `[ALERT]`, `[OPTIMAL]`, `[NO DATA]`, `[HWY+CITY]`, `[PASS]`, `[WARNING]`, `[CRITICAL]`, or `[FAULT]`.
 
-2. Python Environment & Execution
+2. Supported Log Export Format
+   - This application exclusively supports the Car Scanner ELM OBD2 app's vertical export CSV format (semicolon-delimited with headers: `SECONDS`, `PID`, `VALUE`, `UNITS`, `LATITUDE`, `LONGTITUDE`).
+   - Any extension to the data ingestion engine must preserve this specification and pass raw data through the `clean_raw_obd_data()` pipeline prior to ingestion.
+
+3. Python Environment & Execution
    - Always run commands and tests using `.venv/bin/python` or `.venv/bin/pip`.
    - Do NOT invoke system `/usr/bin/python3` directly on macOS because it lacks working Tcl/Tk bindings.
    - The virtual environment is configured with Python 3.14 via Homebrew with `python-tk@3.14`.
 
-3. Architectural Boundaries
-   - Ingestion Layer (`src/data_loader.py`): Handles CSV file I/O, PID parsing, and time synchronization. Keep this layer UI-agnostic and free from CustomTkinter dependencies.
-   - Analytics Layer (`src/analyzer.py`): Contains automotive physics, metric calculations, and diagnostic health logic. Keep this layer pure Python/NumPy/SciPy with zero UI dependencies.
-   - Presentation Layer (`src/ui/`): Contains CustomTkinter components and Matplotlib canvas. It should only call methods on `VehicleAnalyzer` and `ScanTrip` and never perform raw CSV file parsing or recalculate core physics algorithms directly.
+4. Architectural Boundaries
+   - Ingestion Layer (`src/data_loader.py`): Handles CSV file I/O, format validation, physical sensor cleaning, GPS jump sanitization, and time synchronization. Keep this layer UI-agnostic.
+   - Analytics Layer (`src/analyzer.py`): Contains automotive physics, metric calculations, anomaly detection (rules and Isolation Forest), and diagnostic health logic. Keep this layer pure Python/NumPy/SciPy/scikit-learn with zero UI dependencies.
+   - Presentation Layer (`src/ui/`): Contains CustomTkinter components, Matplotlib canvases, and `tkintermapview`. It should only call methods on `VehicleAnalyzer` and `ScanTrip` and never perform raw CSV file parsing or recalculate core physics algorithms directly.
 
 ---
 
@@ -33,8 +37,8 @@ This file provides mandatory guidelines and constraints for any AI agent modifyi
 
 - Language: Python 3.10+ with modern typing annotations (`from typing import List, Dict, Optional, Tuple, Any`).
 - Classes: PascalCase (e.g., `VehicleAnalyzer`, `ScanTrip`, `MetricCard`, `GraphCanvas`).
-- Functions & Variables: snake_case (e.g., `calculate_fuel_economy`, `city_speed_max`, `parse_obd_csv`).
-- Constants: UPPER_SNAKE_CASE (e.g., `PID_MAP`, `BG_DARKEST`, `ACCENT_AMBER`).
+- Functions & Variables: snake_case (e.g., `calculate_fuel_economy`, `clean_raw_obd_data`, `analyze_fuel_trims_in_depth`).
+- Constants: UPPER_SNAKE_CASE (e.g., `PID_MAP`, `SENSOR_BOUNDS`, `BG_DARKEST`, `ACCENT_AMBER`).
 - Styling: PEP 8 compliant. Use descriptive docstrings adhering to the zero emoji directive.
 
 ---

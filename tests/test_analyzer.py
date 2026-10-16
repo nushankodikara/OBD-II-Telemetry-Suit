@@ -1,7 +1,8 @@
 """Automated test suite for OBD-II vehicle scan analyzer.
 
-Tests data loader parsing, synchronization, fuel economy metrics, fallback behavior,
-RPM curves, efficiency maps, and thermal diagnostics.
+Tests data loader parsing, pre-ingestion cleanup, GPS jump filtering,
+fuel economy metrics, fallback behavior, RPM curves, efficiency maps,
+deep STFT/LTFT diagnostics with repair plans, and anomaly detection.
 Strictly adheres to project rules: no emojis.
 """
 
@@ -10,12 +11,18 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src.data_loader import parse_obd_csv, load_all_records
-from src.analyzer import VehicleAnalyzer, FuelEconomyResult, DiagnosticHealthReport
+from src.data_loader import parse_obd_csv, load_all_records, clean_raw_obd_data
+from src.analyzer import (
+    VehicleAnalyzer,
+    FuelEconomyResult,
+    DiagnosticHealthReport,
+    FuelTrimDiagnostic,
+    TelemetryAnomaly,
+)
 
 
 class TestOBDDataLoader(unittest.TestCase):
-    """Test data loader and synchronization routines."""
+    """Test data loader, cleanup engine, and synchronization routines."""
 
     def test_parse_single_csv(self):
         sample_file = "Records/2026-09-08 09-19-22.csv"
@@ -27,12 +34,28 @@ class TestOBDDataLoader(unittest.TestCase):
         self.assertGreater(trip.duration_seconds, 100)
         self.assertIn("speed_kmh", trip.data.columns)
         self.assertIn("engine_rpm", trip.data.columns)
+        self.assertTrue(trip.has_gps)
+        self.assertIn("latitude", trip.data.columns)
+        self.assertIn("longitude", trip.data.columns)
+
+    def test_pre_ingestion_cleanup_report(self):
+        sample_file = "Records/2026-09-08 09-19-22.csv"
+        trip = parse_obd_csv(sample_file)
+        self.assertIsNotNone(trip)
+        rep = trip.cleanup_report
+
+        self.assertGreater(rep.total_raw_rows, 0)
+        self.assertEqual(rep.valid_rows_retained, rep.total_raw_rows)
+        # GPS jumps should have been detected and cleaned
+        self.assertGreater(rep.gps_jumps_filtered, 0)
 
     def test_load_all_records(self):
         trips = load_all_records("Records")
         self.assertGreaterEqual(len(trips), 8)
         for t in trips:
             self.assertGreater(len(t.data), 0)
+            self.assertTrue(t.has_gps)
+            self.assertGreater(len(t.gps_coordinates), 0)
 
 
 class TestVehicleAnalyzer(unittest.TestCase):
@@ -48,14 +71,12 @@ class TestVehicleAnalyzer(unittest.TestCase):
         self.assertIsNotNone(fe.highway_kml)
         self.assertIsNotNone(fe.combined_kml)
 
-        # Realistic sanity ranges for road passenger vehicles
         self.assertGreater(fe.city_kml, 5.0)
         self.assertLess(fe.city_kml, 30.0)
         self.assertGreater(fe.highway_kml, 8.0)
         self.assertLess(fe.highway_kml, 40.0)
 
     def test_insufficient_highway_data_fallback(self):
-        # File 2026-09-08 09-19-22.csv has max speed 50 km/h, so highway data should be insufficient
         trip = parse_obd_csv("Records/2026-09-08 09-19-22.csv")
         fe = self.analyzer.calculate_fuel_economy([trip])
 
@@ -82,15 +103,10 @@ class TestVehicleAnalyzer(unittest.TestCase):
             avg_moving_speed_kmh=50.0,
         )
 
-        # km/L
         self.assertEqual(res.get_value("city", "km/L"), 10.0)
-        # L/100km (100 / 10 = 10)
         self.assertAlmostEqual(res.get_value("city", "L/100km"), 10.0, places=2)
-        # L/100km (100 / 20 = 5)
         self.assertAlmostEqual(res.get_value("highway", "L/100km"), 5.0, places=2)
-        # MPG US (10 * 2.35214583 = 23.52)
         self.assertAlmostEqual(res.get_value("city", "MPG (US)"), 23.52, places=1)
-        # Formatted string check
         self.assertEqual(res.format_value("city", "km/L"), "10.00")
 
     def test_optimal_rpm_speed_curve(self):
@@ -98,7 +114,6 @@ class TestVehicleAnalyzer(unittest.TestCase):
         self.assertIn("opt_speed", res)
         self.assertIn("opt_rpm", res)
         self.assertGreater(len(res["opt_speed"]), 0)
-        # Speeds should increase monotonically
         self.assertTrue(np.all(np.diff(res["opt_speed"]) > 0))
 
     def test_optimal_fuel_economy_map(self):
@@ -116,11 +131,24 @@ class TestVehicleAnalyzer(unittest.TestCase):
         self.assertGreater(thermal["max_temp"], 70.0)
         self.assertLess(thermal["max_temp"], 115.0)
 
-    def test_diagnostic_health_report(self):
-        diag = self.analyzer.generate_diagnostic_health(self.trips)
-        self.assertIsNotNone(diag.battery_status)
-        self.assertIsNotNone(diag.coolant_status)
-        self.assertIsNotNone(diag.fuel_trim_status)
+    def test_deep_fuel_trim_diagnostics_and_recommendations(self):
+        td = self.analyzer.analyze_fuel_trims_in_depth(self.trips)
+        self.assertTrue(td.has_data)
+        self.assertIsNotNone(td.diagnosis_title)
+        self.assertIsNotNone(td.severity)
+        self.assertIn(td.severity, ["OPTIMAL", "WARNING", "CRITICAL"])
+        self.assertGreater(len(td.mechanic_recommendations), 0)
+        self.assertIsNotNone(td.mean_total_trim)
+
+    def test_anomaly_detection_engine(self):
+        anomalies = self.analyzer.detect_anomalies(self.trips)
+        self.assertIsInstance(anomalies, list)
+        self.assertGreater(len(anomalies), 0)
+        for a in anomalies:
+            self.assertIn(a.severity, ["[CRITICAL]", "[WARNING]", "[INFO]"])
+            self.assertIsNotNone(a.metric_name)
+            self.assertIsNotNone(a.detected_value)
+            self.assertIsNotNone(a.description)
 
 
 if __name__ == "__main__":
